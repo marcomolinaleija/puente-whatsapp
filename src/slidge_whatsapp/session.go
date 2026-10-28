@@ -16,6 +16,7 @@ import (
 
 	// Internal packages.
 	"codeberg.org/slidge/slidge-whatsapp/slidge_whatsapp/media"
+	"codeberg.org/slidge/slidge-whatsapp/slidge_whatsapp/voicecore"
 
 	// Third-party libraries.
 	_ "github.com/mattn/go-sqlite3"
@@ -92,18 +93,25 @@ func (s *Session) currentClient() *whatsmeow.Client {
 }
 
 func (s *Session) setClient(client *whatsmeow.Client) {
+	// CAN experimental voice lifecycle v1
 	s.clientMutex.Lock()
+	old := s.client
 	s.client = client
 	s.clientMutex.Unlock()
+	if old != nil { voicecore.Detach(old) }
+	voicecore.Attach(s.ctx, client)
+	if s.currentClient() != client { voicecore.Detach(client) }
 }
 
 func (s *Session) clearClient(client *whatsmeow.Client) {
 	s.clientMutex.Lock()
-	if s.client == client {
+	cleared := s.client == client
+	if cleared {
 		s.canCancelCallRecoveries()
 		s.client = nil
 	}
 	s.clientMutex.Unlock()
+	if cleared { voicecore.Detach(client) }
 }
 
 func (s *Session) startPresenceRefresh(ctx context.Context, client *whatsmeow.Client) {
@@ -1213,6 +1221,7 @@ func (s *Session) handleEvent(evt any) {
 	if client == nil {
 		return
 	}
+	voicecore.Dispatch(client, evt)
 	s.canTraceCallSignal(evt)
 	s.gateway.logger.Debugf("Handling event '%T': %+v", evt, jsonStringer{evt})
 

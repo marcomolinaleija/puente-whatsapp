@@ -1,6 +1,6 @@
 # Base pública exacta; el código de este repositorio sustituye las fuentes.
 ARG BRIDGE_BASE=ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v35@sha256:5cc36c7f2d1cfc08632f6d6e88cd38c009138915069fc0de282c3a43c60de86e
-ARG GO_BUILDER=golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73
+ARG GO_BUILDER=golang:1.26.4-trixie@sha256:68b7145ec43d1820b9a56704554b53d1520aa2a15cb5233e374188a31b2a1bce
 
 FROM ${BRIDGE_BASE} AS baseline
 
@@ -26,8 +26,15 @@ FROM native-builder AS go-tests
 COPY tests/go/ /src/slidge_whatsapp/
 COPY tests/whatsmeow/ /src/slidge_whatsapp/vendor/go.mau.fi/whatsmeow/
 WORKDIR /src/slidge_whatsapp
-RUN go test go.mau.fi/whatsmeow -run '^TestCANStickerPackThumbnailEncryption$' && \
-    go test . && go test -race .
+# Test vectors may include recordings. Fetch the pinned public upstream only
+# in this throwaway test stage; they never enter the repository or release image.
+RUN curl -fsSL 'https://codeload.github.com/JotaDev66/WaCalls/tar.gz/edeb31f0427aba896639db503153b777a405eccf' -o /tmp/voice-upstream.tar.gz && \
+    echo '09de36959a0f378569de2767b985714cc7a9d59c30e9f0ea64f149c386e4dd86  /tmp/voice-upstream.tar.gz' | sha256sum -c - && \
+    mkdir -p /tmp/voice-upstream && tar -xzf /tmp/voice-upstream.tar.gz -C /tmp/voice-upstream --strip-components=1 && \
+    cp -a /tmp/voice-upstream/internal/voip/media/mlow/testdata /src/slidge_whatsapp/voicecore/internal/voip/media/mlow/ && \
+    rm -rf /tmp/voice-upstream /tmp/voice-upstream.tar.gz
+RUN --network=none go test go.mau.fi/whatsmeow -run '^TestCANStickerPackThumbnailEncryption$' && \
+    go test . ./voicecore/... && go test -race . ./voicecore/...
 
 FROM baseline AS runtime
 USER root
@@ -35,7 +42,10 @@ COPY src/slidge/ /venv/lib/python3.13/site-packages/slidge/
 COPY src/slidge_whatsapp/ /venv/lib/python3.13/site-packages/slidge_whatsapp/
 COPY src-overrides/whatsmeow/ /venv/lib/python3.13/site-packages/slidge_whatsapp/vendor/go.mau.fi/whatsmeow/
 COPY --from=native-builder /src/slidge_whatsapp/generated/_whatsapp.cpython-313-x86_64-linux-gnu.so /venv/lib/python3.13/site-packages/slidge_whatsapp/generated/
+COPY runtime/voice_bridge_entrypoint.py /opt/voice-tools/voice_bridge_entrypoint.py
 USER slidge
+ENV CAN_VOICE_ENABLE=0
+ENTRYPOINT ["python", "-B", "/opt/voice-tools/voice_bridge_entrypoint.py"]
 
 FROM runtime AS runtime-tests
 USER root
@@ -55,6 +65,8 @@ RUN --network=none python -B /opt/can-tests/smoke_bridge_number_change_runtime.p
     python -B /opt/can-tests/smoke_bridge_no_auto_join_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_linking_runtime.py && \
     python -B /opt/can-tests/test_bridge_linking.py && \
+    python -B /opt/can-tests/smoke_voice_integration.py && \
+    python -B /opt/can-tests/smoke_voice_activation.py && \
     python -B /opt/can-tests/smoke_bridge_muc_history_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_recovery_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_read_markers_runtime.py && \

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .voice import revoke as revoke_voice
 from .message_info import ingest_message, record_receipt
 
 import asyncio
@@ -179,6 +180,7 @@ class Session(BaseSession[Contact]):
         Disconnect the active WhatsApp session. This will not remove any local or remote state, and
         will thus allow previously authenticated sessions to re-authenticate without needing to pair.
         """
+        await revoke_voice(self)
         self.whatsapp.Disconnect()  # type:ignore[no-untyped-call]
         self.logged = False
 

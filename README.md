@@ -54,9 +54,23 @@ recepción, conservar el mensaje cuando falla un adjunto, evitar bloqueos en la
 carga de contactos y grupos, ordenar los ecos, acotar el historial al entrar en
 un grupo, recuperar lecturas y tolerar caracteres XML inválidos en el archivo.
 Incluye también la vinculación por QR o código telefónico y el reintento de
-sincronización posterior a la autenticación. Aún no se migró el watchdog externo
-ni la integración de voz. El resultado requiere pruebas reales antes de
-considerarse equivalente a la instalación del servidor.
+sincronización posterior a la autenticación. El watchdog externo no está incluido.
+El resultado requiere pruebas reales antes de considerarse equivalente a la
+instalación del servidor.
+
+## Llamadas experimentales
+
+Esta rama integra el motor de voz experimental de WaCalls y su adaptación al
+puente, con las licencias en `src/slidge_whatsapp/voicecore/licenses/`. La voz
+está desactivada por defecto (`CAN_VOICE_ENABLE=0`). Para habilitarla se requiere
+una URL WSS, certificado y clave configurados en el entorno; el arrancador crea
+un socket privado en el directorio del puente. La activación y el despliegue
+requieren validación y autorización separadas.
+
+Las pruebas de Go descargan temporalmente vectores de prueba públicos del commit
+fijado de WaCalls y verifican su SHA-256. Esos vectores pueden incluir grabaciones;
+no se incorporan al repositorio ni a la imagen final. Las pruebas de transporte
+usan datos sintéticos y no conectan cuentas ni llaman a personas.
 
 ## Flujo propuesto
 

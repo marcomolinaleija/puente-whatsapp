@@ -5,7 +5,7 @@ import re
 import string
 import uuid
 import warnings
-from asyncio import Lock
+from asyncio import Lock, sleep as _can_inbound_yield
 from collections.abc import AsyncIterator, Iterable, Iterator
 from contextlib import asynccontextmanager
 from copy import copy
@@ -664,16 +664,18 @@ class LegacyMUC(
         user_part = await self.get_user_participant()
         msg["occupant-id"]["id"] = user_part.stored.occupant_id
 
-        self.archive.add(msg, user_part)
+        # CAN ordered nonblocking group echoes v1
+        # Keep archive-before-send and per-room order across the new await.
+        async with self.session.lock(("can-group-echo", str(self.jid))):
+            await self.archive.add_async(msg, user_part)
 
-        for user_full_jid in self.user_full_jids():
-            self.log.debug("Echoing to %s", user_full_jid)
-            msg = copy(msg)
-            msg.set_to(user_full_jid)
+            for user_full_jid in self.user_full_jids():
+                self.log.debug("Echoing to %s", user_full_jid)
+                msg = copy(msg)
+                msg.set_to(user_full_jid)
+                msg.send()
 
-            msg.send()
-
-        return msg["stanza_id"]["id"]  # type:ignore[no-any-return]
+            return msg["stanza_id"]["id"]  # type:ignore[no-any-return]
 
     def _post_avatar_update(self, cached_avatar: "CachedAvatar | None") -> None:
         self.__send_configuration_change((104,))
@@ -1321,6 +1323,13 @@ class LegacyMUC(
         :param since:
         :return:
         """
+        # CAN bounded join history v2. This is delivery-on-join, not MAM storage.
+        if maxchars == 0 or (maxstanzas is not None and maxstanzas <= 0):
+            return
+        if maxstanzas is None:
+            maxstanzas = 50
+        await _can_inbound_yield(0)
+        emitted = 0
         if since is None:
             if seconds is None:
                 start_date = datetime.now(tz=UTC) - timedelta(days=1)
@@ -1329,14 +1338,18 @@ class LegacyMUC(
         else:
             start_date = since or datetime.now(tz=UTC) - timedelta(days=1)
 
-        for h_msg in self.archive.get_all(
+        history = list(self.archive.get_all(
             start_date=start_date, end_date=None, last_page_n=maxstanzas
-        ):
+        ))
+        for h_msg in history:
             msg = h_msg.stanza_component_ns
             msg["delay"]["stamp"] = h_msg.when
             msg["delay"]["from"] = self.jid
             msg.set_to(full_jid)
             self.xmpp.send(msg, False)
+            emitted += 1
+            if emitted % 5 == 0:
+                await _can_inbound_yield(0)
 
     async def send_mam(self, iq: Iq) -> None:
         await self.__fill_history()
@@ -1789,10 +1802,12 @@ class LegacyMUC(
             because of multi-attachment messages.
         """
         with self.xmpp.store.session() as orm:
-            for stored in self.xmpp.store.mam.get_messages(
+            # CAN release archived reader v1: one message ID, not all history.
+            messages = list(self.xmpp.store.mam.get_messages(
                 orm, self.stored.id, ids=[str(msg_id)]
-            ):
-                yield HistoryMessage(stored.stanza)
+            ))
+            messages = [HistoryMessage(stored.stanza) for stored in messages]
+        yield from messages
 
 
 def set_origin_id(msg: Message, origin_id: str) -> None:

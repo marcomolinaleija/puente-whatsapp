@@ -12,7 +12,7 @@ from slixmpp import (
 )
 from slixmpp.exceptions import XMPPError
 
-from ..util import DispatcherMixin, exceptions_to_xmpp_errors
+from ..util import DispatcherMixin, Ignore, exceptions_to_xmpp_errors
 
 if typing.TYPE_CHECKING:
     from slidge.util.types import AnyGateway
@@ -52,7 +52,8 @@ class MucMiscMixin(DispatcherMixin):
 
         try:
             muc = await self.get_muc_from_stanza(msg)
-        except XMPPError as e:
+        # CAN ignore reflected MUC errors v1: Ignore is BaseException, not Exception.
+        except (XMPPError, Ignore) as e:
             log.debug("Not removing resource", exc_info=e)
             return
         mfrom = msg.get_from()

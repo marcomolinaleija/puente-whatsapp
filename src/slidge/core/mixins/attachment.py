@@ -187,10 +187,11 @@ class AttachmentMixin(TextMessageMixin):
                     )
                     .one_or_none()
                 )
-                if stored is not None:
-                    if not await self.__valid_url(stored.url):
-                        stored.url = None  # type:ignore
-                    return stored
+            # CAN release attachment reader v1: never hold SQL across HTTP.
+            if stored is not None:
+                if not await self.__valid_url(stored.url):
+                    stored.url = None  # type:ignore
+                return stored
         return Attachment(
             user_account_id=None if self.__is_component else self.session.user_pk,
             legacy_file_id=None

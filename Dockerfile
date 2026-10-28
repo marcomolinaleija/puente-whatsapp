@@ -41,7 +41,7 @@ FROM runtime AS runtime-tests
 USER root
 COPY tests/runtime/ /opt/can-tests/
 USER slidge
-RUN python -B /opt/can-tests/smoke_bridge_number_change_runtime.py && \
+RUN --network=none python -B /opt/can-tests/smoke_bridge_number_change_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_read_state_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_message_info_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_call_duration_v33_runtime.py && \
@@ -51,6 +51,26 @@ RUN python -B /opt/can-tests/smoke_bridge_number_change_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_sticker_delivery_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_sticker_accessibility_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_stickers_runtime.py && \
-    python -B /opt/can-tests/smoke_bridge_no_auto_join_runtime.py
+    python -B /opt/can-tests/smoke_bridge_transcription_runtime.py && \
+    python -B /opt/can-tests/smoke_bridge_no_auto_join_runtime.py && \
+    python -B /opt/can-tests/smoke_bridge_recovery_runtime.py && \
+    python -B /opt/can-tests/smoke_bridge_read_markers_runtime.py && \
+    python -B /opt/can-tests/smoke_bridge_group_echo_runtime.py
+
+# Isolated callback probe: inject synthetic events only into this test binary.
+FROM native-builder AS inbound-probe-builder
+COPY tests/inbound/bridge_inbound_probe.go /src/slidge_whatsapp/
+WORKDIR /src/slidge_whatsapp
+RUN python3 -c 'from pathlib import Path; p=Path("session.go"); s=p.read_text(); anchor="s.eventHandler = h"; assert s.count(anchor)==1; p.write_text(s.replace(anchor,anchor+"\n s.canInboundOfflineProbe()"))' && \
+    cd generated && go build -buildmode=c-shared -tags "mupdf extlib can_inbound_probe" \
+    -ldflags="-s -w -extldflags=-Wl,--version-script=/tmp/gopy_whatsapp_exports.map" \
+    -o _whatsapp.cpython-313-x86_64-linux-gnu.so .
+
+FROM runtime AS inbound-probe-tests
+USER root
+COPY --from=inbound-probe-builder /src/slidge_whatsapp/generated/_whatsapp.cpython-313-x86_64-linux-gnu.so /venv/lib/python3.13/site-packages/slidge_whatsapp/generated/
+COPY tests/inbound/smoke_bridge_inbound_runtime.py /opt/can-tests/
+USER slidge
+RUN --network=none python -B /opt/can-tests/smoke_bridge_inbound_runtime.py
 
 FROM runtime AS release

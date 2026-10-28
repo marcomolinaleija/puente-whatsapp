@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 import warnings
@@ -19,21 +20,13 @@ class MessageArchive:
         self.__rooms_store = store.rooms
         self.__store = store.mam
 
-    def add(
+    def _prepare_add(
         self,
         msg: Message,
         participant: "AnyParticipant | None" = None,
         archive_only: bool = False,
         legacy_msg_id: str | None = None,
-    ) -> None:
-        """
-        Add a message to the archive if it is deemed archivable
-
-        :param msg:
-        :param participant:
-        :param archive_only:
-        :param legacy_msg_id:
-        """
+    ) -> tuple[HistoryMessage, str | None] | None:
         if not archivable(msg):
             return
         new_msg = copy(msg)
@@ -57,6 +50,21 @@ class MessageArchive:
         if "replace" in msg:
             legacy_msg_id = None
 
+        return HistoryMessage(new_msg), legacy_msg_id
+
+    def add(
+        self,
+        msg: Message,
+        participant: "AnyParticipant | None" = None,
+        archive_only: bool = False,
+        legacy_msg_id: str | None = None,
+    ) -> None:
+        prepared = self._prepare_add(
+            msg, participant, archive_only, legacy_msg_id,
+        )
+        if prepared is None:
+            return
+        history, legacy_msg_id = prepared
         with self.__store.session(expire_on_commit=False) as orm:
             if self.room.id is None:
                 self.room = self.__rooms_store.get(
@@ -65,11 +73,47 @@ class MessageArchive:
             self.__store.add_message(
                 orm,
                 self.room.id,
-                HistoryMessage(new_msg),
+                history,
                 archive_only,
                 None if legacy_msg_id is None else str(legacy_msg_id),
             )
             orm.commit()
+
+    # CAN nonblocking group echo archive v1
+    async def add_async(
+        self, msg: Message, participant: "AnyParticipant | None" = None,
+        archive_only: bool = False, legacy_msg_id: str | None = None,
+    ) -> None:
+        # Prepare mutable stanza/participant data only on the owner loop.
+        prepared = self._prepare_add(msg, participant, archive_only, legacy_msg_id)
+        if prepared is None:
+            return
+        history, legacy_msg_id = prepared
+        xml, when, stanza_id = str(history.stanza), history.when, history.id
+        room_pk = self.room.id
+        account_pk, room_legacy_id = self.room.user_account_id, self.room.legacy_id
+        store, rooms = self.__store, self.__rooms_store
+
+        def commit():
+            # Only immutable values and stateless stores enter the worker.
+            # Each transaction creates/closes its own session, including on failure.
+            with store.session(expire_on_commit=False) as orm:
+                pk = room_pk
+                if pk is None:
+                    pk = rooms.get(orm, account_pk, room_legacy_id).id
+                message = HistoryMessage(xml, when=when)
+                message.id = stanza_id
+                store.add_message(orm, pk, message, archive_only,
+                                  None if legacy_msg_id is None else str(legacy_msg_id))
+                orm.commit()
+
+        task = asyncio.create_task(asyncio.to_thread(commit))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Do not release the caller's room lock while SQL is still running.
+            await asyncio.gather(task, return_exceptions=True)
+            raise
 
     def __iter__(self) -> Iterator[HistoryMessage]:
         return iter(self.get_all())

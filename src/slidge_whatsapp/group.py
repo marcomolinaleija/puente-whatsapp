@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
@@ -333,7 +334,8 @@ class Bookmarks(LegacyBookmarks[MUC]):
     session: "Session"
 
     async def fill(self) -> None:
-        groups = self.session.whatsapp.GetGroups()  # type:ignore[no-untyped-call]
+        # CAN nonblocking group fill v1
+        groups = await asyncio.to_thread(lambda: list(self.session.whatsapp.GetGroups()))
         for group in groups:
             await self.add_whatsapp_group(group)
 

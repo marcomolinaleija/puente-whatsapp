@@ -1,3 +1,7 @@
+import asyncio
+from sqlalchemy import select
+from ....db.models import ContactSent
+
 from typing import TYPE_CHECKING
 
 from slixmpp import JID, Message
@@ -48,7 +52,32 @@ class MarkerMixin(DispatcherMixin):
         if isinstance(recipient, LegacyMUC) and hook is not None:
             return await hook(msg_id)
         if self.xmpp.MARK_ALL_MESSAGES:
-            return recipient.pop_unread_xmpp_ids_up_to(msg_id)
+            # CAN nonblocking contact read markers v1
+            # Snapshot the scalar on the owner loop; no ORM instance crosses threads.
+            contact_pk = recipient.stored.id
+            assert contact_pk is not None
+            store = self.xmpp.store
+
+            def pop():
+                # Each worker owns and closes its SQLAlchemy session, even on failure.
+                with store.session.begin() as orm:
+                    # A duplicate/unknown horizon must not consume newer messages.
+                    if orm.scalar(select(ContactSent.id).where(
+                        ContactSent.contact_id == contact_pk, ContactSent.msg_id == msg_id,
+                    )) is None:
+                        return []
+                    ids = store.contacts.pop_sent_up_to(orm, contact_pk, msg_id)
+                    return ids
+
+            # Reuse the session's named locks: overlapping markers cannot pop twice.
+            async with recipient.session.lock(("can-read-markers", contact_pk)):
+                task = asyncio.create_task(asyncio.to_thread(pop))
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # A cancelled coroutine must not unlock while its SQL worker runs.
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise
         else:
             return [msg_id]
 

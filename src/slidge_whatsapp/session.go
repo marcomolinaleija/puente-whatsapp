@@ -62,6 +62,9 @@ const (
 // sessions need to be established by logging in, after which incoming events will be forwarded to
 // the adapter event handler, and outgoing events will be forwarded to WhatsApp.
 type Session struct {
+	// CAN inbound isolation v1
+	canInboundMutex sync.Mutex
+	canInbound *canInboundDispatcher
 	canCallRecoveryMutex sync.Mutex
 	canCallRecoveries    map[string]*canCallRecoveryEntry
 	device               LinkedDevice      // The linked device this session corresponds to.
@@ -216,6 +219,7 @@ func (s *Session) Login() error {
 
 	// Try to fetch existing device from given device JID.
 	s.ctx, s.ctxCancel = context.WithCancelCause(context.Background())
+	s.canStartInbound()
 	if s.device.ID != "" {
 		store, err = s.gateway.container.GetDevice(s.ctx, s.device.JID())
 		if err != nil {
@@ -293,12 +297,14 @@ func (s *Session) Disconnect() error {
 	client := s.currentClient()
 	s.stopPresenceRefresh()
 	if client == nil {
+		s.canStopInbound()
 		return nil
 	}
 
 	client.Disconnect()
 	s.ctxCancel(nil)
 	s.clearClient(client)
+	s.canStopInbound()
 	return nil
 }
 
@@ -602,6 +608,7 @@ func setReplyContext(payload *waE2E.Message, message Message) {
 
 func (s *Session) getMessagePayload(ctx context.Context, message Message) *waE2E.Message {
 	// Compose extended message when made as a reply to a different message.
+	// CAN payload composition v1
 	var payload *waE2E.Message
 	if message.ReplyID != "" {
 		participant := message.OriginActor.JID
@@ -642,8 +649,10 @@ func (s *Session) getMessagePayload(ctx context.Context, message Message) *waE2E
 
 	// Add URL preview, if any was given in message.
 	if message.Preview.URL != "" {
-		if payload == nil {
-			payload = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: &message.Body}}
+		if payload == nil { payload = &waE2E.Message{} }
+		if payload.ExtendedTextMessage == nil {
+			payload.Conversation = nil
+			payload.ExtendedTextMessage = &waE2E.ExtendedTextMessage{Text: &message.Body}
 		}
 
 		switch message.Preview.Kind {
@@ -671,8 +680,10 @@ func (s *Session) getMessagePayload(ctx context.Context, message Message) *waE2E
 
 	// Attach any inline mentions extended metadata.
 	if len(message.MentionJIDs) > 0 {
-		if payload == nil {
-			payload = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: &message.Body}}
+		if payload == nil { payload = &waE2E.Message{} }
+		if payload.ExtendedTextMessage == nil {
+			payload.Conversation = nil
+			payload.ExtendedTextMessage = &waE2E.ExtendedTextMessage{Text: &message.Body}
 		}
 		if payload.ExtendedTextMessage.ContextInfo == nil {
 			payload.ExtendedTextMessage.ContextInfo = &waE2E.ContextInfo{}
@@ -681,13 +692,15 @@ func (s *Session) getMessagePayload(ctx context.Context, message Message) *waE2E
 	}
 
 	// Process any location information in message, if possible.
-	if message.Location.Latitude > 0 || message.Location.Longitude > 0 {
-		if payload == nil {
-			payload = &waE2E.Message{LocationMessage: &waE2E.LocationMessage{}}
-		}
-		payload.LocationMessage.DegreesLatitude = &message.Location.Latitude
-		payload.LocationMessage.DegreesLongitude = &message.Location.Longitude
-		payload.LocationMessage.AccuracyInMeters = ptrTo(uint32(message.Location.Accuracy))
+	if message.Location.Latitude != 0 || message.Location.Longitude != 0 {
+		// A location is the content; keep reply/mention context, not a second body.
+		contextInfo := payload.GetExtendedTextMessage().GetContextInfo()
+		payload = &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+			DegreesLatitude: &message.Location.Latitude,
+			DegreesLongitude: &message.Location.Longitude,
+			AccuracyInMeters: ptrTo(uint32(message.Location.Accuracy)),
+			ContextInfo: contextInfo,
+		}}
 	}
 
 	if payload == nil {
@@ -783,27 +796,31 @@ func preferContactCandidate(current, candidate Contact) bool {
 }
 
 func (s *Session) GetContacts(refresh bool) ([]Contact, error) {
-	if s.client == nil || s.client.Store.ID == nil {
+	// CAN bounded roster snapshot v2
+	client := s.currentClient()
+	if client == nil || client.Store == nil || client.Store.ID == nil {
 		return nil, fmt.Errorf("cannot get contacts for unauthenticated session")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
 
 	// Synchronize remote application state with local state if requested.
 	if refresh {
-		err := s.client.FetchAppState(s.ctx, appstate.WAPatchCriticalUnblockLow, false, false)
+		err := client.FetchAppState(ctx, appstate.WAPatchCriticalUnblockLow, false, false)
 		if err != nil {
 			s.gateway.logger.Warnf("Could not get app state from server: %s", err)
 		}
 	}
 
 	// Synchronize local contact state with overarching gateway for all local contacts.
-	data, err := s.client.Store.Contacts.GetAllContacts(s.ctx)
+	data, err := client.Store.Contacts.GetAllContacts(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed getting local contacts: %s", err)
 	}
 
 	contactsByJID := make(map[string]Contact)
 	for jid, info := range data {
-		candidate := newContact(s.client, newActor(s.ctx, s.client, jid), info)
+		candidate := newContact(client, newActor(ctx, client, jid), info)
 		key := candidate.Actor.JID
 		if key == "" {
 			continue
@@ -818,11 +835,14 @@ func (s *Session) GetContacts(refresh bool) ([]Contact, error) {
 	for _, contact := range contactsByJID {
 		contacts = append(contacts, contact)
 	}
+	if s.currentClient() != client { return nil, fmt.Errorf("roster session changed") }
 	return contacts, nil
 }
 
 func (s *Session) SubscribeToPresences() error {
-	return s.subscribeToPresences(s.ctx, s.currentClient())
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	return s.subscribeToPresences(ctx, s.currentClient())
 }
 
 func (s *Session) subscribeToPresences(ctx context.Context, client *whatsmeow.Client) error {
@@ -849,20 +869,25 @@ func (s *Session) subscribeToPresences(ctx context.Context, client *whatsmeow.Cl
 // GetGroups returns a list of all group-chats currently joined in WhatsApp, along with additional
 // information on present participants.
 func (s *Session) GetGroups() ([]Group, error) {
-	if s.client == nil || s.client.Store.ID == nil {
+	// CAN bounded roster snapshot v2
+	client := s.currentClient()
+	if client == nil || client.Store == nil || client.Store.ID == nil {
 		return nil, fmt.Errorf("cannot get groups for unauthenticated session")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
 
-	data, err := s.client.GetJoinedGroups(s.ctx)
+	data, err := client.GetJoinedGroups(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed getting groups: %s", err)
 	}
 
 	var groups []Group
 	for _, info := range data {
-		groups = append(groups, newGroup(s.ctx, s.client, info))
+		groups = append(groups, newGroup(ctx, client, info))
 	}
 
+	if s.currentClient() != client { return nil, fmt.Errorf("roster session changed") }
 	return groups, nil
 }
 
@@ -1158,30 +1183,7 @@ func shouldDropTransientEvent(kind EventKind, payload *EventPayload) bool {
 // PropagateEvent handles the given event kind and payload with the adapter event handler defined in
 // [Session.SetEventHandler].
 func (s *Session) propagateEvent(kind EventKind, payload *EventPayload) {
-	if s.eventHandler == nil {
-		s.gateway.logger.Errorf("Event handler not set when propagating event %d with payload %v", kind, payload)
-		return
-	} else if kind == EventUnknown {
-		return
-	}
-
-	// Send empty payload instead of a nil pointer, as Python has trouble handling the latter.
-	if payload == nil {
-		payload = &EventPayload{}
-	}
-
-	if shouldDropTransientEvent(kind, payload) {
-		s.gateway.logger.Debugf("Dropping unresolved transient WhatsApp event before callback enqueue: kind=%d", kind)
-		return
-	}
-
-	if kind == EventCall {
-		s.canObserveCall(payload)
-	}
-	callback := func() { s.eventHandler(kind, payload) }
-	if !s.gateway.callDispatcher.enqueue(kind, callback) {
-		s.gateway.logger.Warnf("Dropping transient WhatsApp event because transient callback queue is full: kind=%d", kind)
-	}
+    s.canQueuePayload(kind, payload)
 }
 
 // HandleEvent processes the given incoming WhatsApp event, checking its concrete type and
@@ -1234,33 +1236,13 @@ func (s *Session) handleEvent(evt any) {
 			s.gateway.logger.Warnf("Failed to send available presence: %s", err)
 		}
 	case *events.HistorySync:
-		for _, record := range evt.Data.GetCallLogRecords() {
-			kind, payload := newCallLogRecordEvent(s.ctx, client, record, "history_sync")
-			if payload != nil {
-				s.propagateEvent(kind, payload)
-			}
-		}
-		switch evt.Data.GetSyncType() {
-		case waHistorySync.HistorySync_PUSH_NAME:
-			for _, n := range evt.Data.GetPushnames() {
-				s.propagateEvent(newContactEventFromHistory(s.ctx, client, n))
-			}
-		case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT, waHistorySync.HistorySync_ON_DEMAND:
-			for _, c := range evt.Data.GetConversations() {
-				for _, msg := range c.GetMessages() {
-					s.propagateEvent(newEventFromHistory(s.ctx, client, msg.GetMessage()))
-				}
-			}
-		}
-	case *events.Message:
-		if evt.Message != nil && evt.Message.GetCallLogMesssage() != nil {
-			kind, payload := newCallLogMessageEvent(s.ctx, client, evt)
-			if payload != nil {
-				s.propagateEvent(kind, payload)
-			}
-		} else {
-			s.propagateEvent(newMessageEvent(s.ctx, client, evt))
-		}
+        ctx := s.ctx
+        d := s.canGetInbound()
+        d.enqueue(d.history, func(){
+            if ctx.Err()==nil && s.currentClient()==client { s.canHandleHistory(ctx,client,evt) }
+        }, false)
+    case *events.Message:
+        s.canQueueMessage(s.ctx,client,evt)
 	case *events.Receipt:
 		s.propagateEvent(newReceiptEvent(s.ctx, client, evt))
 	case *events.MarkChatAsRead:
@@ -1319,6 +1301,7 @@ func (s *Session) handleEvent(evt any) {
 		}
 		s.ctxCancel(nil)
 		s.propagateEvent(EventLoggedOut, &EventPayload{LoggedOut: LoggedOut{Reason: evt.Reason.String()}})
+		s.canStopInbound()
 	case *events.PairSuccess:
 		if client.Store.ID == nil {
 			s.gateway.logger.Errorf("Pairing succeeded, but device ID is missing")
@@ -1412,5 +1395,42 @@ func (s *Session) MarkChatRead(receipt Receipt) error {
 			s.gateway.logger.Infof("CAN_READ_STATE stage=recovered collection=%s", name)
 		}
 		return err
+	}, func(ctx context.Context, name appstate.WAPatchName) error {
+		// CAN primary snapshot recovery v1: never reset collections or devices.
+		_, err := client.SendPeerMessage(ctx, whatsmeow.BuildAppStateRecoveryRequest(name))
+		if err == nil {
+			s.gateway.logger.Infof("CAN_READ_STATE stage=peer_recovery_requested collection=%s", name)
+		}
+		return err
 	})
+}
+
+func (s *Session) canHandleHistory(ctx context.Context, client *whatsmeow.Client, evt *events.HistorySync) {
+
+    emit:=func(kind EventKind,payload *EventPayload){
+        if ctx.Err()==nil && s.currentClient()==client {
+            if kind==EventCall && payload!=nil { s.canObserveCall(payload) }
+            s.canDeliverInbound(kind,payload)
+        }
+    }
+		for _, record := range evt.Data.GetCallLogRecords() {
+			kind, payload := newCallLogRecordEvent(ctx, client, record, "history_sync")
+			if payload != nil {
+				emit(kind, payload)
+			}
+		}
+		switch evt.Data.GetSyncType() {
+		case waHistorySync.HistorySync_PUSH_NAME:
+			for _, n := range evt.Data.GetPushnames() {
+				emit(newContactEventFromHistory(ctx, client, n))
+			}
+		case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT, waHistorySync.HistorySync_ON_DEMAND:
+			for _, c := range evt.Data.GetConversations() {
+				for _, msg := range c.GetMessages() {
+					if ctx.Err()!=nil || s.currentClient()!=client { return }
+					emit(newEventFromHistory(ctx, client, msg.GetMessage()))
+				}
+			}
+		}
+
 }

@@ -80,6 +80,13 @@ def get_engine(path: str, echo: bool = False, pool_size: int = 5) -> sa.Engine:
     from sqlalchemy import log as sqlalchemy_log
 
     engine = sa.create_engine(path, pool_size=pool_size)
+    # CAN rollback unfinished SQLite commits v1
+    # A failed COMMIT can leave DBAPI active even after SQLAlchemy closes it.
+    if engine.dialect.name == "sqlite":
+        @sa.event.listens_for(engine, "reset")
+        def rollback_unfinished(dbapi_connection, _record, reset_state):
+            if not reset_state.terminate_only and dbapi_connection.in_transaction:
+                dbapi_connection.rollback()
     if echo:
         sqlalchemy_log._add_default_handler = lambda x: None  # type:ignore
         engine.echo = True

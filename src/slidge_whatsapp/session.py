@@ -2,6 +2,7 @@ from __future__ import annotations
 from .message_info import ingest_message, record_receipt
 
 import asyncio
+from concurrent.futures import CancelledError as CallbackCancelled
 import json
 import warnings
 from collections.abc import Callable, Coroutine
@@ -277,8 +278,9 @@ class Session(BaseSession[Contact]):
     async def __sync_roster_after_connect(self) -> None:
         try:
             await self.contacts.ready
-            wa_contacts = list(
-                self.whatsapp.GetContacts(refresh=True)  # type:ignore
+            # CAN nonblocking roster v1
+            wa_contacts = await asyncio.to_thread(
+                lambda: list(self.whatsapp.GetContacts(refresh=True))
             )
             saved_contacts = sum(bool(contact.IsFriend) for contact in wa_contacts)
             self.log.info(
@@ -820,7 +822,10 @@ class Session(BaseSession[Contact]):
                 "Running contact sync after group contacts in roster policy change"
             )
             # This updates the "friend" status of contacts
-            for wa_contact in self.whatsapp.GetContacts(refresh=True):  # type:ignore[no-untyped-call]
+            wa_contacts = await asyncio.to_thread(
+                lambda: list(self.whatsapp.GetContacts(refresh=True))
+            )
+            for wa_contact in wa_contacts:
                 await self.contacts.add_whatsapp_contact(wa_contact)
             # This works but is really hacky, slidge core should expose this more cleanly
             await SyncContacts.sync(self, self, self.user_jid)  # type:ignore
@@ -998,7 +1003,10 @@ def make_sync(
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
         result = func(*args, **kwargs)
         future = asyncio.run_coroutine_threadsafe(result, loop)
-        return future.result()
+        try:
+            return future.result()
+        except CallbackCancelled:
+            return None
 
     return wrapper
 
@@ -1025,3 +1033,7 @@ def _bytes_conversion(slice_byte: go.Slice_byte) -> bytes | None:
         # panic: runtime error: index out of range [0] with length 0
         return None
     return bytes(slice_byte)
+
+# CAN inbound isolation v1
+from .inbound import install as _install_inbound
+_install_inbound(Session, whatsapp)

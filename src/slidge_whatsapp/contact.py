@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
@@ -154,10 +155,9 @@ class Roster(LegacyRoster[Contact]):
         Retrieve contacts from remote WhatsApp service, subscribing to their presence and adding to
         local roster.
         """
-        wa_contacts = list(
-            self.session.whatsapp.GetContacts(  # type:ignore[no-untyped-call]
-                refresh=config.ALWAYS_SYNC_ROSTER
-            )
+        # CAN nonblocking contact fill v1
+        wa_contacts = await asyncio.to_thread(
+            lambda: list(self.session.whatsapp.GetContacts(refresh=config.ALWAYS_SYNC_ROSTER))
         )
         self._refresh_mexico_aliases(wa_contacts)
 
@@ -174,7 +174,7 @@ class Roster(LegacyRoster[Contact]):
             contact = await self.add_whatsapp_contact(wa_contact)
             if contact is not None:
                 yield contact
-        self.session.whatsapp.SubscribeToPresences()  # type:ignore[no-untyped-call]
+        await asyncio.to_thread(self.session.whatsapp.SubscribeToPresences)
 
     async def add_whatsapp_contact(self, data: whatsapp.Contact) -> Contact | None:
         """

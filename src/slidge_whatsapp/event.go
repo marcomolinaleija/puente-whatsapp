@@ -589,8 +589,9 @@ func newMessageEvent(ctx context.Context, client *whatsmeow.Client, evt *events.
 
 	// Handle message attachments, if any.
 	if attach, context, err := getMessageAttachments(ctx, client, evt.Message); err != nil {
-		client.Log.Errorf("Failed getting message attachments: %s", err)
-		return EventUnknown, nil
+        client.Log.Warnf("CAN_INBOUND attachment_unavailable class=%s", canAttachmentFailureClass(err))
+        message = canUnavailableAttachment(message, evt.Message)
+        if context != nil { message = getMessageWithContext(ctx,client,message,context) }
 	} else if len(attach) > 0 {
 		message.Attachments = append(message.Attachments, attach...)
 		message.Kind = MessageAttachment
@@ -739,6 +740,9 @@ func lottieStickerAccessibilityCaption(data []byte) string {
 // via WhatsApp. Any failures in retrieving any attachment will return an error immediately.
 // media attachment context is propagated
 func getMessageAttachments(ctx context.Context, client *whatsmeow.Client, message *waE2E.Message) ([]Attachment, *waE2E.ContextInfo, error) {
+    // CAN inbound isolation v1
+    ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+    defer cancel()
 	if pack := message.GetStickerPackMessage(); pack != nil {
 		attachment := receiveStickerPack(ctx, client.Download, pack)
 		return []Attachment{attachment}, pack.GetContextInfo(), nil
@@ -789,7 +793,7 @@ func getMessageAttachments(ctx context.Context, client *whatsmeow.Client, messag
 		// Attempt to download and decrypt raw attachment data, if any.
 		data, err := client.Download(ctx, msg)
 		if err != nil {
-			return nil, nil, err
+			return nil, info, err
 		}
 
 		a.Data = data
@@ -1325,8 +1329,9 @@ func newEventFromHistory(ctx context.Context, client *whatsmeow.Client, info *wa
 
 	// Handle message attachments, if any.
 	if attach, context, err := getMessageAttachments(ctx, client, info.GetMessage()); err != nil {
-		client.Log.Errorf("Failed getting message attachments: %s", err)
-		return EventUnknown, nil
+        client.Log.Warnf("CAN_INBOUND attachment_unavailable class=%s", canAttachmentFailureClass(err))
+        message = canUnavailableAttachment(message, info.GetMessage())
+        if context != nil { message = getMessageWithContext(ctx,client,message,context) }
 	} else if len(attach) > 0 {
 		message.Attachments = append(message.Attachments, attach...)
 		message.Kind = MessageAttachment

@@ -37,6 +37,7 @@ de stickers y los once smokes de runtime. No se conectó una cuenta real.
 ```sh
 docker build --target go-tests --output type=cacheonly .
 docker build --target runtime-tests --output type=cacheonly .
+docker build --target inbound-probe-tests --output type=cacheonly .
 docker build --target release -t puente-can-migration:baseline-v35 .
 ```
 
@@ -47,6 +48,15 @@ Las pruebas no publican ni despliegan una imagen.
 La v35 conserva una llamada que acepta ciertos enlaces de invitación al procesar
 un mensaje. **Esta base no corrige ese comportamiento**; debe tratarse en una rama
 y validarse antes de publicar una nueva imagen.
+
+La rama de desarrollo incorpora mejoras del puente desplegado para aislar la
+recepción, conservar el mensaje cuando falla un adjunto, evitar bloqueos en la
+carga de contactos y grupos, ordenar los ecos, acotar el historial al entrar en
+un grupo, recuperar lecturas y tolerar caracteres XML inválidos en el archivo.
+El reintento de sincronización posterior a la autenticación depende de la
+integración de vinculación nueva y aún no está incorporado. Tampoco se migró el
+watchdog externo ni la integración de voz. El resultado requiere pruebas reales
+antes de considerarse equivalente a la instalación del servidor.
 
 ## Flujo propuesto
 

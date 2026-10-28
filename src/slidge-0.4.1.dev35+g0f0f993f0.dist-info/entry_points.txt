@@ -1,0 +1,2 @@
+[console_scripts]
+slidge = slidge.main:main

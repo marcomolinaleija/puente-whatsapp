@@ -1,0 +1,141 @@
+Metadata-Version: 2.4
+Name: slidge
+Version: 0.4.1.dev35+g0f0f993f0
+Summary: XMPP bridging framework
+Author-email: Nicolas Cedilnik <nicoco@nicoco.fr>
+License-Expression: AGPL-3.0-or-later
+Project-URL: Homepage, https://codeberg.org/slidge/
+Project-URL: Issues, https://codeberg.org/slidge/slidge/issues
+Project-URL: Repository, https://codeberg.org/slidge/slidge/
+Project-URL: Chat room, https://conference.nicoco.fr:5281/muc_log/slidge/
+Project-URL: Documentation, https://slidge.im/docs/slidge/main
+Project-URL: changelog, https://codeberg.org/slidge/slidge/releases
+Keywords: xmpp,gateway,bridge,instant messaging
+Classifier: Topic :: Internet :: XMPP
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: aiohttp[speedups]~=3.11
+Requires-Dist: alembic~=1.14
+Requires-Dist: configargparse~=1.7
+Requires-Dist: defusedxml~=0.7.1
+Requires-Dist: pillow~=12.0
+Requires-Dist: python-magic~=0.4.27
+Requires-Dist: qrcode~=8.0
+Requires-Dist: slixmpp~=1.17
+Requires-Dist: sqlalchemy~=2.0
+Requires-Dist: thumbhash~=0.1.2
+Provides-Extra: lottie
+Requires-Dist: rlottie-python~=1.3.8; extra == "lottie"
+Provides-Extra: postgres
+Requires-Dist: psycopg2-binary<3,>=2.9.11; extra == "postgres"
+Dynamic: license-file
+
+![Slidge logo](https://codeberg.org/slidge/slidge/raw/branch/main/dev/assets/slidge-color-small.png)
+
+[![woodpecker CI status](https://ci.codeberg.org/api/badges/14027/status.svg)](https://ci.codeberg.org/repos/14027)
+[![coverage](https://slidge.im/coverage/slidge/main/coverage.svg)](https://slidge.im/coverage/slidge/main)
+[![Chat](https://rooms.slidge.im:5281/muc_badge/support@rooms.slidge.im)](https://conference.nicoco.fr:5281/muc_log/slidge/)
+
+Slidge is an XMPP (puppeteer) gateway library in python.
+It makes
+[writing gateways to other chat networks](https://slidge.im/docs/slidge/main/dev/tutorial.html)
+(*legacy modules*) as frictionless as possible.
+It supports fancy IM features, such as
+[(emoji) reactions](https://xmpp.org/extensions/xep-0444.html),
+[replies](https://xmpp.org/extensions/xep-0461.html), and
+[retractions](https://xmpp.org/extensions/xep-0424.html).
+The full list of supported XEPs in on [xmpp.org](https://xmpp.org/software/slidge/).
+
+Status
+------
+
+Slidge is **beta**-grade software. It support groups and 1:1 chats.
+Try slidge and give us some
+feedback, through the [MUC](xmpp:support@rooms.slidge.im?join) or the
+[issue tracker](https://codeberg.org/slidge/slidge/issues).
+Don't be shy!
+
+Usage
+-----
+
+A minimal (and fictional!) slidge-powered "legacy module" looks like this:
+
+```python
+from cool_chat_lib import CoolClient
+from slidge import BaseGateway, BaseSession
+from slidge.contact import LegacyContact
+from slidge.group import LegacyMUC
+from slidge.db import GatewayUser
+from slidge.util.types import XMPPMessage
+
+
+class Gateway(BaseGateway):
+    # Various aspects of the gateway component are configured as class
+    # attributes of the concrete Gateway class
+    COMPONENT_NAME = "Gateway to the super duper chat network"
+
+
+class Session(BaseSession):
+    async def login(self, user: GatewayUser) -> None:
+        self.legacy_client = CoolClient(
+            login=user.legacy_module_data["username"],
+            password=user.legacy_module_data["password"],
+        )
+        await self.legacy_client.login()
+
+
+class Contact(LegacyContact):
+    async def on_message(self, msg: XMPPMessage) -> str:
+        """
+        Triggered when the slidge user sends an XMPP message through the gateway
+        """
+        sent = self.session.legacy_client.send_message(text=text, destination=self.legacy_id)
+        return str(sent.message_id)
+```
+
+There's more in [the tutorial](https://slidge.im/docs/slidge/main/dev/tutorial.html)!
+
+Installation
+------------
+
+⚠️  Slidge is a lib for gateway developers, if you are an XMPP server admin and
+want to install gateways on your server, you are looking for a
+[slidge-based gateway](https://codeberg.org/explore/repos?q=slidge&topic=1).
+or the
+[slidge-debian](https://git.sr.ht/~nicoco/slidge-debian)
+bundle.
+
+[![pypi version](https://badge.fury.io/py/slidge.svg)](https://pypi.org/project/slidge/)
+
+[![Packaging status](https://repology.org/badge/vertical-allrepos/slidge.svg)](https://repology.org/project/slidge/versions)
+
+Slidge is available on
+[codeberg](https://codeberg.org/slidge/slidge/releases)
+and [pypi](https://pypi.org/project/slidge/).
+Refer to [the docs](https://slidge.im/docs/slidge/main/admin/install.html) for details.
+
+About privacy
+-------------
+
+Slidge (and most if not all XMPP gateway that I know of) will break
+end-to-end encryption, or more precisely one of the 'ends' become the
+gateway itself. If privacy is a major concern for you, my advice would
+be to:
+
+-   use XMPP + OMEMO
+-   self-host your gateways
+-   have your gateways hosted by someone you know AFK and trust
+
+Related projects
+----------------
+
+-   [Spectrum](https://www.spectrum.im/)
+-   [telegabber](https://dev.narayana.im/narayana/telegabber)
+-   [biboumi](https://biboumi.louiz.org/)
+-   [Bifröst](https://github.com/matrix-org/matrix-bifrost)
+-   [Mautrix](https://github.com/mautrix)
+-   [matterbridge](https://github.com/42wim/matterbridge)
+
+Thank you, [Trung](https://trung.fun/), for the slidge logo!

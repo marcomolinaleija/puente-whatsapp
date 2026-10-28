@@ -1,0 +1,13 @@
+.git
+src/slidge_whatsapp/vendor
+src/*.dist-info/uv_*.json
+src/*.dist-info/direct_url.json
+**/__pycache__
+**/*.pyc
+**/*.so
+.env*
+**/*.sqlite*
+**/*.db
+**/*.log
+.test-results
+dist

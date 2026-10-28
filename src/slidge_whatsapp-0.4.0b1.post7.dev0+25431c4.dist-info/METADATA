@@ -1,0 +1,63 @@
+Metadata-Version: 2.4
+Name: slidge-whatsapp
+Version: 0.4.0b1.post7.dev0+25431c4
+Summary: A WhatsApp/XMPP gateway
+License-Expression: AGPL-3.0-or-later
+Keywords: xmpp,gateway,bridge,instant messaging,chat,whatsapp
+Author: deuill
+Author-email: alex@deuill.org
+Requires-Python: >= 3.11
+Classifier: Topic :: Internet :: XMPP
+Requires-Dist: linkpreview (>=0.11.0)
+Requires-Dist: slidge (>=0.4.0b0,<0.5)
+Project-URL: Chat room, https://slidge.im/xmpp-web/#/guest?join=slidge@conference.nicoco.fr
+Project-URL: Documentation, https://slidge.im/docs/slidge-whatsapp/main
+Project-URL: Homepage, https://codeberg.org/slidge/slidge-whatsapp
+Project-URL: Issues, https://codeberg.org/slidge/slidge-whatsapp/issues
+Project-URL: Repository, https://codeberg.org/slidge/slidge-whatsapp
+Project-URL: changelog, https://codeberg.org/slidge/slidge-whatsapp/releases
+Description-Content-Type: text/markdown
+
+# slidge-whatsapp
+
+A
+[feature-rich](https://slidge.im/docs/slidge-whatsapp/main/user/features.html)
+[WhatsApp](https://whatsapp.com) to
+[XMPP](https://xmpp.org/) puppeteering
+[gateway](https://xmpp.org/extensions/xep-0100.html), based on
+[slidge](https://slidge.im) and
+[whatsmeow](https://github.com/tulir/whatsmeow).
+
+[![CI pipeline status](https://ci.codeberg.org/api/badges/14066/status.svg)](https://ci.codeberg.org/repos/14066)
+[![Chat](https://rooms.slidge.im:5281/muc_badge/support@rooms.slidge.im)](https://slidge.im/xmpp-web/#/guest?join=support@rooms.slidge.im)
+[![PyPI package version](https://badge.fury.io/py/slidge-whatsapp.svg)](https://pypi.org/project/slidge-whatsapp/)
+
+
+
+
+slidge-whatsapp lets you chat with users of WhatsApp without leaving your favorite XMPP client.
+
+## Quickstart
+
+```sh
+docker run codeberg.org/slidge/slidge-whatsapp \  # works with podman too
+    --jid whatsapp.example.org \  # can be whatever you want it to be
+    --secret some-secret \  # must match your XMPP server config
+    --home-dir /somewhere/writeable  # for data persistence
+```
+
+Use the `:latest-amd64` tag for the latest release, `:vX.X.X-amd64` for release X.X.X, and `:main-amd64`
+for the bleeding edge.`-arm64` images are also available.
+
+If you do not like containers, other installation methods are detailed
+[in the docs](https://slidge.im/docs/slidge-whatsapp/main/admin/install.html).
+
+## Documentation
+
+Hosted on [codeberg pages](https://slidge.im/docs/slidge-whatsapp/main/).
+
+## Contributing
+
+Contributions are **very** welcome, and we tried our best to make it easy
+to start hacking on slidge-whatsapp. See [CONTRIBUTING.md](./CONTRIBUTING.md).
+

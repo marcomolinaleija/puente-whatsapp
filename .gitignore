@@ -1,0 +1,16 @@
+# La imagen incluía vendor parcialmente recuperado; Go usa go.mod/go.sum.
+/src/slidge_whatsapp/vendor/
+/src/*.dist-info/uv_*.json
+/src/*.dist-info/direct_url.json
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.db
+*.log
+dist/
+.test-results/

@@ -253,16 +253,13 @@ class Session(BaseSession[Contact]):
                     self.__get_connected_status_message(), show="chat"
                 )
         elif connect.Error != "":
-            self.xmpp.loop.call_soon_threadsafe(
-                self.__connected.set_exception,
-                XMPPError("internal-server-error", connect.Error),
-            )
+            if not self.__connected.done():
+                self.__connected.set_exception(XMPPError("internal-server-error", connect.Error))
         else:
             self.contacts.user_legacy_id = connect.JID
             self.user_phone = "+" + connect.JID.split("@")[0]
-            self.xmpp.loop.call_soon_threadsafe(
-                self.__connected.set_result, self.__get_connected_status_message()
-            )
+            if not self.__connected.done():
+                self.__connected.set_result(self.__get_connected_status_message())
 
         if connect.Error == "":
             self.__schedule_roster_sync()
@@ -839,7 +836,7 @@ class Session(BaseSession[Contact]):
             )
 
     def __reset_connected(self) -> None:
-        if hasattr(self, "__connected") and not self.__connected.done():
+        if hasattr(self, "_Session__connected") and not self.__connected.done():
             self.xmpp.loop.call_soon_threadsafe(self.__connected.cancel)
         self.__connected: asyncio.Future[str] = self.xmpp.loop.create_future()
 

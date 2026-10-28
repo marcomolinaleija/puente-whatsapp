@@ -12,6 +12,7 @@ from slixmpp import JID
 from . import config
 from .avatar_safety import disable_avatar_sync, safe_avatar_preferences
 from .generated import whatsapp
+from .linking import install as install_linking
 from .message_info import install
 
 if TYPE_CHECKING:
@@ -82,6 +83,7 @@ class Gateway(BaseGateway["Session"]):
         self.whatsapp.TempDir = str(global_config.HOME_DIR / "tmp")
         self.whatsapp.Init()
         install(self)
+        install_linking(self)
 
     async def validate(
         self, user_jid: JID, registration_form: dict[str, str | None]

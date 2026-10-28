@@ -233,7 +233,10 @@ func (s *Session) Login() error {
 
 	client := whatsmeow.NewClient(store, s.gateway.logger)
 	s.setClient(client)
-	client.AddEventHandler(s.handleEvent)
+	// CAN linking lifecycle v1
+	client.AddEventHandler(func(event any) {
+		if s.currentClient() == client { s.handleEvent(event) }
+	})
 	client.AutomaticMessageRerequestFromPhone = true
 	client.EmitAppStateEventsOnFullSync = true
 
@@ -250,7 +253,14 @@ func (s *Session) Login() error {
 	}
 
 	// Attempt out-of-band registration of client via QR code.
-	qrChan, _ := client.GetQRChannel(s.ctx)
+	ctx := s.ctx
+	qrChan, qrErr := client.GetQRChannel(ctx)
+	if qrErr != nil {
+		s.stopPresenceRefresh()
+		s.clearClient(client)
+		s.ctxCancel(qrErr)
+		return fmt.Errorf("cannot initialize QR channel: %w", qrErr)
+	}
 	if err = client.ConnectContext(s.ctx); err != nil {
 		s.stopPresenceRefresh()
 		s.clearClient(client)
@@ -260,18 +270,26 @@ func (s *Session) Login() error {
 
 	go func() {
 		for e := range qrChan {
+			if s.currentClient() != client || ctx.Err() != nil { return }
 			switch e.Event {
 			case whatsmeow.QRChannelEventCode:
-				s.propagateEvent(EventQRCode, &EventPayload{QRCode: e.Code})
-			case whatsmeow.QRChannelEventError:
-				s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: e.Error.Error()}})
-			case whatsmeow.QRChannelTimeout.Event:
-				s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "You did not flash the QR code in time. Use re-login when you are ready."}})
+				s.propagateEvent(EventQRCode, &EventPayload{QRCode: canLinkQRPayload(e.Code, e.Timeout)})
 			case whatsmeow.QRChannelSuccess.Event:
 				return
 			default:
-				s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: e.Event}})
+				reason := "pair_failed"
+				switch e.Event {
+				case whatsmeow.QRChannelTimeout.Event: reason = "expired"
+				case whatsmeow.QRChannelClientOutdated.Event: reason = "client_outdated"
+				case "passkey-request", "passkey-confirmation": reason = "unsupported_pairing"
+				}
+				// Unknown/empty events never masquerade as a successful connection.
+				s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "can-link:"+reason}})
+				return
 			}
+		}
+		if s.currentClient() == client && ctx.Err() == nil && !client.IsLoggedIn() {
+			s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "can-link:pair_failed"}})
 		}
 	}()
 
@@ -312,15 +330,16 @@ func (s *Session) Disconnect() error {
 // user's primary device, as identified by the given phone number. This will return an error if the
 // [Session] is already paired, or if the phone number given is empty or invalid.
 func (s *Session) PairPhone(phone string) (string, error) {
-	if s.client == nil {
+	client := s.currentClient()
+	if client == nil || !client.IsConnected() {
 		return "", fmt.Errorf("cannot pair for uninitialized session")
-	} else if s.client.Store.ID != nil {
+	} else if client.Store.ID != nil {
 		return "", fmt.Errorf("refusing to pair for connected session")
 	} else if phone == "" {
 		return "", fmt.Errorf("cannot pair for empty phone number")
 	}
 
-	code, err := s.client.PairPhone(s.ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	code, err := client.PairPhone(s.ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		return "", fmt.Errorf("failed to pair with phone number: %s", err)
 	}
@@ -1208,7 +1227,7 @@ func (s *Session) handleEvent(evt any) {
 			}
 		}
 	case *events.AppStateSyncComplete:
-		if len(client.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
+		if client.IsLoggedIn() && client.Store.ID != nil && evt.Name == appstate.WAPatchCriticalBlock {
 			s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{JID: s.device.JID().ToNonAD().String()}})
 			if err := client.SendPresence(s.ctx, passiveWhatsAppPresence(PresenceAvailable)); err != nil {
 				s.gateway.logger.Warnf("Failed to send available presence: %s", err)
@@ -1222,13 +1241,21 @@ func (s *Session) handleEvent(evt any) {
 			s.gateway.logger.Errorf("failed to connect: %s", evt.Message)
 			s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: evt.Message}})
 		}
+	case *events.Disconnected:
+		s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "can-link:disconnected"}})
+	case *events.ClientOutdated:
+		s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "can-link:client_outdated"}})
+	case *events.StreamReplaced:
+		s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "can-link:stream_replaced"}})
+	case *events.PairError:
+		s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "can-link:pair_failed"}})
 	case *events.Connected, *events.PushNameSetting:
 		// Backfill only after authentication, also on a real reconnect.
 		if _, connected := evt.(*events.Connected); connected {
 			s.canCallLog("CAN_CALL stage=diagnostics_ready")
 			go s.syncCallLogAppState(client)
 		}
-		if len(client.Store.PushName) == 0 {
+		if !client.IsLoggedIn() || client.Store.ID == nil {
 			return
 		}
 		s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{JID: s.device.JID().ToNonAD().String()}})
@@ -1433,4 +1460,10 @@ func (s *Session) canHandleHistory(ctx context.Context, client *whatsmeow.Client
 			}
 		}
 
+}
+
+// canLinkQRPayload preserves WhatsMeow's per-code expiry across the existing gopy API.
+func canLinkQRPayload(code string, ttl time.Duration) string {
+    data, _ := json.Marshal(map[string]any{"code": code, "ttl": ttl.Seconds()})
+    return string(data)
 }

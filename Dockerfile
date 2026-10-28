@@ -53,6 +53,9 @@ RUN --network=none python -B /opt/can-tests/smoke_bridge_number_change_runtime.p
     python -B /opt/can-tests/smoke_bridge_stickers_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_transcription_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_no_auto_join_runtime.py && \
+    python -B /opt/can-tests/smoke_bridge_linking_runtime.py && \
+    python -B /opt/can-tests/test_bridge_linking.py && \
+    python -B /opt/can-tests/smoke_bridge_muc_history_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_recovery_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_read_markers_runtime.py && \
     python -B /opt/can-tests/smoke_bridge_group_echo_runtime.py

@@ -18,6 +18,7 @@ from slidge.core.mixins.attachment import AttachmentMixin
 from slidge.db.models import Attachment
 from slidge.group.room import LegacyMUC
 from slidge.util.archive_msg import HistoryMessage
+from slidge_whatsapp import linking
 from slidge_whatsapp import session as session_module
 from slidge_whatsapp.contact import Roster
 from slidge_whatsapp.group import Bookmarks
@@ -251,9 +252,79 @@ async def roster_roundtrip(expect_old):
     return {"native_roster_roundtrips": len(completed), "native_calls_off_loop": all(off_loop)}
 
 
+async def roster_failure_recovery(expect_failure=False):
+    """Inject the real GetGroups failure through installed Bookmarks.fill/login wrapper."""
+    class Gateway(SimpleNamespace):
+        def __getitem__(self, _):
+            return SimpleNamespace(add_feature=Mock())
+
+    loop = asyncio.get_running_loop()
+    contacts = SimpleNamespace(ready=loop.create_future())
+    contacts.ready.set_result(True)
+    groups = SimpleNamespace(ready=loop.create_future())
+    gateway = Gateway(default_ns="jabber:component:accept", GROUPS=True,
+                      register_handler=Mock(), has_crashed=False)
+    session = SimpleNamespace(contacts=contacts, bookmarks=groups, xmpp=gateway,
+                              logged=True, is_logging_in=True, send_gateway_status=Mock())
+    groups.session = session
+    groups.fill = lambda: Bookmarks.fill(groups)
+    calls = []
+
+    def native():
+        calls.append(threading.get_ident())
+        if len(calls) == 1:
+            raise RuntimeError("failed getting groups: context deadline exceeded")
+        return []
+
+    session.whatsapp = SimpleNamespace(GetGroups=native)
+    owner = linking.state(session)
+
+    async def original(_):
+        owner.authenticated = True  # Native Connected already arrived.
+        owner.change("connected")
+        await groups.fill()
+
+    gateway.login_wrap = AsyncMock(side_effect=original)
+    original_login = gateway.login_wrap
+    linking.install(gateway)
+    caught = None
+    sleeps = []
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    with patch.object(linking.asyncio, "sleep", side_effect=sleep):
+        try:
+            await gateway.login_wrap(session)
+        except RuntimeError as exc:
+            caught = exc
+        if expect_failure:
+            assert caught is not None, "baseline no longer reproduces fatal sync exception"
+            fatal_loop = SimpleNamespace(stop=Mock())
+            BaseGateway._BaseGateway__exception_handler(
+                gateway, fatal_loop, {"exception": caught},
+            )
+            assert gateway.has_crashed
+            fatal_loop.stop.assert_called_once()
+        else:
+            assert caught is None, "authenticated roster failure escaped to fatal handler"
+            assert owner.snapshot()["sync"] == "error" and owner.authenticated
+            await owner.sync_task
+            assert owner.snapshot()["sync"] == "ready" and owner.authenticated
+            assert sleeps == [30] and len(calls) == 2
+            assert threading.get_ident() not in calls
+            assert not gateway.has_crashed and not session.is_logging_in
+            session.send_gateway_status.assert_called_once_with("Logged in", show="chat")
+            original_login.assert_awaited_once()
+    return {"post_auth_sync_exception_escaped": caught is not None,
+            "sync_recovered_without_login": not expect_failure}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expect-old", action="store_true")
+    parser.add_argument("--sync-only", action="store_true")
+    parser.add_argument("--expect-sync-failure", action="store_true")
     parser.add_argument("--muc-errors-only", action="store_true")
     parser.add_argument("--expect-muc-failure", action="store_true")
     parser.add_argument("--archive-xml-only", action="store_true")
@@ -265,9 +336,13 @@ if __name__ == "__main__":
     if args.archive_xml_only:
         print(json.dumps(archive_xml(args.expect_xml_failure)))
         raise SystemExit(0)
+    if args.sync_only:
+        print(json.dumps(asyncio.run(roster_failure_recovery(args.expect_sync_failure))))
+        raise SystemExit(0)
     result = asyncio.run(readers(args.expect_old))
     result.update(asyncio.run(roster_roundtrip(args.expect_old)))
     if not args.expect_old:
+        result.update(asyncio.run(roster_failure_recovery()))
         result.update(asyncio.run(muc_errors()))
         result.update(archive_xml())
     print(json.dumps({"recovery_runtime": "baseline_reproduced" if args.expect_old else "pass",

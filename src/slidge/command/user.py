@@ -329,7 +329,9 @@ class Login(Command[AnySession]):
             )
         finally:
             session.is_logging_in = False
-        session.logged = True
+        # login_wrap already updates logged; it can also return a failure message.
+        if not session.logged:
+            return msg
         session.send_gateway_status(msg or "Re-connected", show="chat")
         session.send_gateway_message(msg or "Re-connected")
         return msg

@@ -53,10 +53,10 @@ La rama de desarrollo incorpora mejoras del puente desplegado para aislar la
 recepción, conservar el mensaje cuando falla un adjunto, evitar bloqueos en la
 carga de contactos y grupos, ordenar los ecos, acotar el historial al entrar en
 un grupo, recuperar lecturas y tolerar caracteres XML inválidos en el archivo.
-El reintento de sincronización posterior a la autenticación depende de la
-integración de vinculación nueva y aún no está incorporado. Tampoco se migró el
-watchdog externo ni la integración de voz. El resultado requiere pruebas reales
-antes de considerarse equivalente a la instalación del servidor.
+Incluye también la vinculación por QR o código telefónico y el reintento de
+sincronización posterior a la autenticación. Aún no se migró el watchdog externo
+ni la integración de voz. El resultado requiere pruebas reales antes de
+considerarse equivalente a la instalación del servidor.
 
 ## Flujo propuesto
 

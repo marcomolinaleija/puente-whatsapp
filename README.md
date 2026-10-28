@@ -45,9 +45,10 @@ Estas comprobaciones no acreditan el funcionamiento real con una cuenta de
 WhatsApp, envío o recepción, NVDA, ni equivalencia completa con la imagen original.
 Las pruebas no publican ni despliegan una imagen.
 
-La v35 conserva una llamada que acepta ciertos enlaces de invitación al procesar
-un mensaje. **Esta base no corrige ese comportamiento**; debe tratarse en una rama
-y validarse antes de publicar una nueva imagen.
+La fuente de desarrollo elimina la unión automática al procesar enlaces de
+invitación y conserva el mensaje y su vista previa. El cambio requiere reconstruir
+y validar el adaptador nativo antes de publicar o desplegar una imagen; no modifica
+las imágenes existentes ni incorpora todavía una acción explícita para unirse.
 
 La rama de desarrollo incorpora mejoras del puente desplegado para aislar la
 recepción, conservar el mensaje cuando falla un adjunto, evitar bloqueos en la

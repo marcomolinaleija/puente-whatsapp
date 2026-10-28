@@ -10,7 +10,6 @@ from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast
-from urllib.parse import quote as url_quote
 from xml.etree import ElementTree as ET
 
 import sqlalchemy
@@ -468,13 +467,6 @@ class Session(BaseSession[Contact]):
                 message.Actor.LID,
             )
             return
-        if message.GroupInvite.JID:
-            muc = await self.bookmarks.by_legacy_id(message.GroupInvite.JID)
-            muc_name = f"{muc.name} xmpp:{url_quote(muc.jid.user)}@{muc.jid.server}"
-            self.send_gateway_message(
-                f"Received group invite for {muc_name} from {actor.name}, auto-joining…"
-            )
-
         match message.Kind:
             case whatsapp.MessagePlain:
                 await self.on_wa_msg_plain(message, actor, muc)

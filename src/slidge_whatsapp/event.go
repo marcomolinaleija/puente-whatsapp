@@ -614,16 +614,6 @@ func newMessageEvent(ctx context.Context, client *whatsmeow.Client, evt *events.
 			Thumbnail:   e.GetJPEGThumbnail(),
 		}
 
-		// Handle group-chat invite link in text message.
-		if code, ok := strings.CutPrefix(e.GetMatchedText(), whatsmeow.InviteLinkPrefix); ok {
-			code, _, _ := strings.Cut(code, "?")
-			if groupJID, err := client.JoinGroupWithLink(ctx, code); err != nil {
-				client.Log.Errorf("Failed joining group with invite: %s", err)
-			} else {
-				message.GroupInvite = Group{JID: groupJID.ToNonAD().String()}
-			}
-		}
-
 		message = getMessageWithContext(ctx, client, message, e.GetContextInfo())
 	}
 

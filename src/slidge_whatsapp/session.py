@@ -1,7 +1,10 @@
 from __future__ import annotations
+from .voice import revoke as revoke_voice
 from .message_info import ingest_message, record_receipt
 
 import asyncio
+# CAN native callback archive completion v2
+from slidge.can_archive_delivery import delivery_scope
 from concurrent.futures import CancelledError as CallbackCancelled
 import json
 import warnings
@@ -178,6 +181,7 @@ class Session(BaseSession[Contact]):
         Disconnect the active WhatsApp session. This will not remove any local or remote state, and
         will thus allow previously authenticated sessions to re-authenticate without needing to pair.
         """
+        await revoke_voice(self)
         self.whatsapp.Disconnect()  # type:ignore[no-untyped-call]
         self.logged = False
 
@@ -357,6 +361,7 @@ class Session(BaseSession[Contact]):
         elif state.Kind == whatsapp.ChatStatePaused:
             contact.paused()
 
+    @delivery_scope
     async def on_wa_receipt(self, receipt: whatsapp.Receipt) -> None:
         """
         Handle incoming delivered/read receipt, as propagated by the WhatsApp adapter.
@@ -493,6 +498,7 @@ class Session(BaseSession[Contact]):
             else None
         )
 
+    @delivery_scope
     async def on_wa_msg_plain(
         self, message: whatsapp.Message, actor: Contact | Participant, muc: MUC | None
     ) -> None:
@@ -506,6 +512,7 @@ class Session(BaseSession[Contact]):
             is_forwarded=message.IsForwarded,
         )
 
+    @delivery_scope
     async def on_wa_msg_attachment(
         self, message: whatsapp.Message, actor: Contact | Participant, muc: MUC | None
     ) -> None:
@@ -557,6 +564,7 @@ class Session(BaseSession[Contact]):
                 continue
             Path(attachment.path).unlink(missing_ok=True)
 
+    @delivery_scope
     async def __transcribe_and_send(
         self,
         actor: Contact | Participant,
@@ -608,6 +616,7 @@ class Session(BaseSession[Contact]):
                 f"Transcrito en {elapsed:.1f} s."
             )
 
+    @delivery_scope
     async def on_wa_msg_edit(
         self, message: whatsapp.Message, actor: Contact | Participant, muc: MUC | None
     ) -> None:
@@ -620,6 +629,7 @@ class Session(BaseSession[Contact]):
             correction_event_id=message.ID,
         )
 
+    @delivery_scope
     async def on_wa_msg_revoke(
         self, message: whatsapp.Message, actor: Contact | Participant, muc: MUC | None
     ) -> None:
@@ -629,12 +639,14 @@ class Session(BaseSession[Contact]):
             assert isinstance(actor, Participant)
             actor.moderate(legacy_msg_id=message.ID)
 
+    @delivery_scope
     async def on_wa_msg_reaction(
         self, message: whatsapp.Message, actor: Contact | Participant, _muc: MUC | None
     ) -> None:
         emojis = [message.Body] if message.Body else []
         actor.react(legacy_msg_id=message.ID, emojis=emojis, carbon=message.Actor.IsMe)
 
+    @delivery_scope
     async def on_wa_msg_poll(
         self, message: whatsapp.Message, actor: Contact | Participant, muc: MUC | None
     ) -> None:

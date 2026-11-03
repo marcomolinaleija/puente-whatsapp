@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -666,6 +667,9 @@ class LegacyMUC(
 
         # CAN ordered nonblocking group echoes v1
         # Keep archive-before-send and per-room order across the new await.
+        # CAN allow queued participant deliveries v2
+        # Let earlier synchronous _send calls enter the same FIFO room lock.
+        await asyncio.sleep(0)
         async with self.session.lock(("can-group-echo", str(self.jid))):
             await self.archive.add_async(msg, user_part)
 

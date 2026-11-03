@@ -298,6 +298,9 @@ class BaseGateway(
             fix_error_ns=True,
         )
         self.loop.set_exception_handler(self.__exception_handler)
+        # CAN functional healthcheck v1
+        from slidge.can_health import install
+        install(self)
         self.loop.create_task(self.__set_http())
         self.has_crashed: bool = False
         self.use_origin_id = False

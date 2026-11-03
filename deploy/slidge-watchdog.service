@@ -1,0 +1,8 @@
+[Unit]
+Description=Watchdog for Slidge WhatsApp bridge
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/slidge-watchdog

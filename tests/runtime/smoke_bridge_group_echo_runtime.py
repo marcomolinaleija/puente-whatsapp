@@ -11,10 +11,11 @@ import threading
 from contextlib import contextmanager
 from copy import copy
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-sys.path.insert(0, "/opt/read-marker-tools")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from slidge.core.dispatcher.message import marker as marker_module
 from slidge.db.models import ArchivedMessage, Room
 from slidge.group.archive import MessageArchive

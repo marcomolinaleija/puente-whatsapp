@@ -13,6 +13,7 @@ from . import config
 from .avatar_safety import disable_avatar_sync, safe_avatar_preferences
 from .generated import whatsapp
 from .linking import install as install_linking
+from .voice import install as install_voice
 from .message_info import install
 
 if TYPE_CHECKING:
@@ -82,6 +83,7 @@ class Gateway(BaseGateway["Session"]):
         (global_config.HOME_DIR / "tmp").mkdir(exist_ok=True)
         self.whatsapp.TempDir = str(global_config.HOME_DIR / "tmp")
         self.whatsapp.Init()
+        install_voice(self)
         install(self)
         install_linking(self)
 

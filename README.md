@@ -50,14 +50,63 @@ invitación y conserva el mensaje y su vista previa. El cambio requiere reconstr
 y validar el adaptador nativo antes de publicar o desplegar una imagen; no modifica
 las imágenes existentes ni incorpora todavía una acción explícita para unirse.
 
-La rama de desarrollo incorpora mejoras del puente desplegado para aislar la
-recepción, conservar el mensaje cuando falla un adjunto, evitar bloqueos en la
-carga de contactos y grupos, ordenar los ecos, acotar el historial al entrar en
-un grupo, recuperar lecturas y tolerar caracteres XML inválidos en el archivo.
-Incluye también la vinculación por QR o código telefónico y el reintento de
-sincronización posterior a la autenticación. Aún no se migró el watchdog externo
-ni la integración de voz. El resultado requiere pruebas reales antes de
-considerarse equivalente a la instalación del servidor.
+La integración del VPS incorpora aislamiento de recepción, recuperación de
+lecturas y vinculación, archivo asíncrono R7, salud funcional y voz. El watchdog
+externo está en `deploy/`, separado de la imagen. Las fuentes preservan la
+protección del repo contra la unión automática al recibir invitaciones.
+
+## Voz, salud y versión Web
+
+- `src/slidge_whatsapp/voicecore/` contiene el backend nativo de llamadas,
+  transporte y códec MLow. `voice.py` integra el transporte con Slidge.
+- `runtime/voice_bridge_entrypoint.py` prepara el socket privado **antes** de
+  cargar Go; conserva los argumentos de `slidge-whatsapp` y el directorio de
+  datos. Voz está desactivada por defecto (`CAN_VOICE_ENABLE=0`).
+- Al habilitar voz, el administrador configura `CAN_VOICE_ENABLE=1`,
+  `CAN_VOICE_URL`, `CAN_VOICE_CERT` y `CAN_VOICE_KEY`. Certificado y clave son
+  montajes externos de sólo lectura, nunca contenido del repositorio o imagen.
+  `CAN_VOICE_HOME` debe coincidir con `--home-dir`; no se debe fijar manualmente
+  el socket generado por el entrypoint.
+- La comprobación de salud verifica el bucle principal, archivo y una respuesta
+  XMPP. No acredita por sí sola que una cuenta esté conectada a WhatsApp.
+- La versión Web compilada se registra al iniciar. El baseline actual es
+  `2.3000.1052556849`; reemplaza el número rechazado con `client_outdated (405)`.
+  No se descarga una versión arbitraria durante el arranque ni se borra la sesión.
+
+El target `release` depende de Go/race, regresiones de invitaciones y versión,
+smokes del runtime y un probe nativo de recepción. BuildKit no puede omitirlos al
+construir ese target. El probe inyectado sólo existe en una variante de prueba;
+el binario distribuido no lo contiene. No se ejecutan tests del cliente CAN.
+
+La migración de voz conserva las licencias MIT de WaCalls y MLow, junto a la
+licencia AGPL de Slidge. Se incluyen las tres tablas binarias del códec. Los 19
+vectores públicos de prueba se descargan sólo en el stage aislado de tests:
+están excluidos de Git y de la imagen distribuida porque pueden contener audio
+de referencia. Su archivo público y todos los hashes están fijados en
+`build/voice-upstream.json` y `build/voice-fixtures.sha256`. No se importaron
+grabaciones privadas, cuentas, sesiones, credenciales ni logs del VPS.
+
+La validación previa de la integración aprobó 216 casos Go y los mismos con
+`-race`, 23 comprobaciones del runtime y el probe nativo de recepción. Conserva
+los dos skips upstream del códec (`TestSmplTablesCDF` y `TestSynth`). La entrega
+final vuelve a aplicar estas barreras sobre la fusión, sin ejecutar tests de CAN.
+
+## Procedencia de esta integración
+
+La referencia fue la imagen validada en el VPS el 2 de noviembre de 2026,
+ImageID `sha256:a5c1e8f6a557dd04054f0653831868252655886e3edaa6736a00f3a35abed919`.
+Se compararon fuentes de Slidge/WhatsApp, voz y los tres overrides de Whatsmeow;
+se integraron los archivos, no un binario previamente compilado. `go.mod` y
+`go.sum` contienen las dependencias efectivas de la reconstrucción, sin rutas de
+reemplazo específicas del VPS. Las dependencias Python siguen siendo las de la
+base pública fijada por digest.
+
+El Dockerfile todavía usa esa base para Python y recursos; no es una
+reconstrucción independiente del sistema operativo ni una promesa de igualdad
+binaria con el VPS. La prueba humana previa verificó mensajes y llamadas en el
+VPS con CAN de código y ejecutable; la nueva imagen debe superar sus propias
+barreras antes de publicarse. Publicar no cambia automáticamente el contenedor
+del VPS ni las instalaciones de otras personas.
 
 ## Flujo propuesto
 

@@ -1,0 +1,60 @@
+#!/bin/sh
+# Restart only a stopped container or an explicitly failed application healthcheck.
+# Historical read-sync/503 warnings do not establish a fatal bridge failure.
+set -eu
+
+CONTAINER=slidge-whatsapp
+STATE_DIR=${STATE_DIR:-/var/lib/slidge-watchdog}
+STATE_FILE="$STATE_DIR/state"
+LOCK_FILE=${LOCK_FILE:-/run/lock/slidge-watchdog.lock}
+COOLDOWN=900
+WINDOW=3600
+MAX_RESTARTS=2
+
+mkdir -p "$STATE_DIR"
+exec 9>"$LOCK_FILE"
+flock -n 9 || exit 0
+
+now=$(date +%s)
+window_start=0
+restart_count=0
+last_restart=0
+if [ -r "$STATE_FILE" ]; then
+  . "$STATE_FILE"
+fi
+if [ "$window_start" -eq 0 ] || [ $((now - window_start)) -ge "$WINDOW" ]; then
+  window_start=$now
+  restart_count=0
+fi
+
+# An inspect failure (daemon unavailable or container absent) is not permission
+# to mutate another container or hide the diagnostic as a successful check.
+running=$(docker inspect -f '{{.State.Running}}' "$CONTAINER")
+health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER")
+reason=""
+if [ "$running" != "true" ]; then
+  reason="container not running"
+elif [ "$health" = "unhealthy" ]; then
+  reason="application healthcheck failed"
+fi
+
+if [ -n "$reason" ]; then
+  if [ $((now - last_restart)) -lt "$COOLDOWN" ]; then
+    logger -t slidge-watchdog -- "$reason; restart suppressed during cooldown"
+    exit 0
+  fi
+  if [ "$restart_count" -ge "$MAX_RESTARTS" ]; then
+    logger -t slidge-watchdog -- "$reason; restart limit reached"
+    exit 0
+  fi
+  logger -t slidge-watchdog -- "$reason; restarting $CONTAINER"
+  # Retain bounded, content-free evidence before recovery, not conversations.
+  umask 077
+  docker inspect -f '{{json .State}}' "$CONTAINER" > "$STATE_DIR/before-restart-state.json"
+  docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}} {{.PIDs}}' "$CONTAINER" > "$STATE_DIR/before-restart-resources.txt" || true
+  restart_count=$((restart_count + 1))
+  last_restart=$now
+  printf 'window_start=%s\nrestart_count=%s\nlast_restart=%s\n' "$window_start" "$restart_count" "$last_restart" > "$STATE_FILE"
+  docker restart "$CONTAINER" >/dev/null
+fi
+printf 'window_start=%s\nrestart_count=%s\nlast_restart=%s\n' "$window_start" "$restart_count" "$last_restart" > "$STATE_FILE"

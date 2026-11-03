@@ -96,14 +96,14 @@ async def run():
     else:
         raise AssertionError("Bare-JID mutation boundary was allowed")
     native = {}
-    for name in ("linking-go.jsonl", "linking-race.jsonl"):
-        path = Path("/opt/linking-tools") / name
-        if path.exists():
-            rows = [json.loads(line) for line in path.read_text().splitlines()]
-            assert not any(row.get("Action") == "fail" for row in rows)
-            native[name] = sum(
-                row.get("Action") == "pass" and bool(row.get("Test")) for row in rows
-            )
+    for name in ("go.jsonl", "race.jsonl"):
+        path = Path(__file__).with_name(name)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        assert not any(row.get("Action") == "fail" for row in rows)
+        native[name] = sum(
+            row.get("Action") == "pass" and bool(row.get("Test")) for row in rows
+        )
+        assert native[name], "No current native cases executed"
     print(json.dumps({"offline_linking": "pass", "native": native}))
 
 

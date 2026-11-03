@@ -11,3 +11,4 @@ src/*.dist-info/direct_url.json
 **/*.log
 .test-results
 dist
+src/slidge_whatsapp/voicecore/internal/voip/media/mlow/testdata

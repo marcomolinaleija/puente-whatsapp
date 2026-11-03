@@ -135,6 +135,7 @@ func NewGateway() *Gateway {
 // calls to [Gateway.Session].
 func (w *Gateway) Init() error {
 	w.logger = walog.Stdout("slidge", w.LogLevel, false)
+	w.logger.Infof("CAN WhatsApp Web client version: %s", store.GetWAVersion())
 	container, err := sqlstore.New(context.Background(), "sqlite3", w.DBPath, w.logger)
 	if err != nil {
 		return err

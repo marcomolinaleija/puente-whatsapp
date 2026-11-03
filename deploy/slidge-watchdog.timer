@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Slidge WhatsApp watchdog
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=slidge-watchdog.service
+
+[Install]
+WantedBy=timers.target

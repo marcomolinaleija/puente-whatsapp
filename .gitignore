@@ -14,3 +14,5 @@ __pycache__/
 *.log
 dist/
 .test-results/
+# Upstream codec fixtures may contain recordings; fetch only for isolated tests.
+/src/slidge_whatsapp/voicecore/internal/voip/media/mlow/testdata/

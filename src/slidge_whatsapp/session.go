@@ -16,6 +16,7 @@ import (
 
 	// Internal packages.
 	"codeberg.org/slidge/slidge-whatsapp/slidge_whatsapp/media"
+	"codeberg.org/slidge/slidge-whatsapp/slidge_whatsapp/voicecore"
 
 	// Third-party libraries.
 	_ "github.com/mattn/go-sqlite3"
@@ -63,8 +64,8 @@ const (
 // the adapter event handler, and outgoing events will be forwarded to WhatsApp.
 type Session struct {
 	// CAN inbound isolation v1
-	canInboundMutex sync.Mutex
-	canInbound *canInboundDispatcher
+	canInboundMutex      sync.Mutex
+	canInbound           *canInboundDispatcher
 	canCallRecoveryMutex sync.Mutex
 	canCallRecoveries    map[string]*canCallRecoveryEntry
 	device               LinkedDevice      // The linked device this session corresponds to.
@@ -92,18 +93,31 @@ func (s *Session) currentClient() *whatsmeow.Client {
 }
 
 func (s *Session) setClient(client *whatsmeow.Client) {
+	// CAN experimental voice lifecycle v1
 	s.clientMutex.Lock()
+	old := s.client
 	s.client = client
 	s.clientMutex.Unlock()
+	if old != nil {
+		voicecore.Detach(old)
+	}
+	voicecore.Attach(s.ctx, client)
+	if s.currentClient() != client {
+		voicecore.Detach(client)
+	}
 }
 
 func (s *Session) clearClient(client *whatsmeow.Client) {
 	s.clientMutex.Lock()
-	if s.client == client {
+	cleared := s.client == client
+	if cleared {
 		s.canCancelCallRecoveries()
 		s.client = nil
 	}
 	s.clientMutex.Unlock()
+	if cleared {
+		voicecore.Detach(client)
+	}
 }
 
 func (s *Session) startPresenceRefresh(ctx context.Context, client *whatsmeow.Client) {
@@ -235,7 +249,9 @@ func (s *Session) Login() error {
 	s.setClient(client)
 	// CAN linking lifecycle v1
 	client.AddEventHandler(func(event any) {
-		if s.currentClient() == client { s.handleEvent(event) }
+		if s.currentClient() == client {
+			s.handleEvent(event)
+		}
 	})
 	client.AutomaticMessageRerequestFromPhone = true
 	client.EmitAppStateEventsOnFullSync = true
@@ -270,7 +286,9 @@ func (s *Session) Login() error {
 
 	go func() {
 		for e := range qrChan {
-			if s.currentClient() != client || ctx.Err() != nil { return }
+			if s.currentClient() != client || ctx.Err() != nil {
+				return
+			}
 			switch e.Event {
 			case whatsmeow.QRChannelEventCode:
 				s.propagateEvent(EventQRCode, &EventPayload{QRCode: canLinkQRPayload(e.Code, e.Timeout)})
@@ -279,12 +297,15 @@ func (s *Session) Login() error {
 			default:
 				reason := "pair_failed"
 				switch e.Event {
-				case whatsmeow.QRChannelTimeout.Event: reason = "expired"
-				case whatsmeow.QRChannelClientOutdated.Event: reason = "client_outdated"
-				case "passkey-request", "passkey-confirmation": reason = "unsupported_pairing"
+				case whatsmeow.QRChannelTimeout.Event:
+					reason = "expired"
+				case whatsmeow.QRChannelClientOutdated.Event:
+					reason = "client_outdated"
+				case "passkey-request", "passkey-confirmation":
+					reason = "unsupported_pairing"
 				}
 				// Unknown/empty events never masquerade as a successful connection.
-				s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "can-link:"+reason}})
+				s.propagateEvent(EventConnect, &EventPayload{Connect: Connect{Error: "can-link:" + reason}})
 				return
 			}
 		}
@@ -668,7 +689,9 @@ func (s *Session) getMessagePayload(ctx context.Context, message Message) *waE2E
 
 	// Add URL preview, if any was given in message.
 	if message.Preview.URL != "" {
-		if payload == nil { payload = &waE2E.Message{} }
+		if payload == nil {
+			payload = &waE2E.Message{}
+		}
 		if payload.ExtendedTextMessage == nil {
 			payload.Conversation = nil
 			payload.ExtendedTextMessage = &waE2E.ExtendedTextMessage{Text: &message.Body}
@@ -699,7 +722,9 @@ func (s *Session) getMessagePayload(ctx context.Context, message Message) *waE2E
 
 	// Attach any inline mentions extended metadata.
 	if len(message.MentionJIDs) > 0 {
-		if payload == nil { payload = &waE2E.Message{} }
+		if payload == nil {
+			payload = &waE2E.Message{}
+		}
 		if payload.ExtendedTextMessage == nil {
 			payload.Conversation = nil
 			payload.ExtendedTextMessage = &waE2E.ExtendedTextMessage{Text: &message.Body}
@@ -715,10 +740,10 @@ func (s *Session) getMessagePayload(ctx context.Context, message Message) *waE2E
 		// A location is the content; keep reply/mention context, not a second body.
 		contextInfo := payload.GetExtendedTextMessage().GetContextInfo()
 		payload = &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
-			DegreesLatitude: &message.Location.Latitude,
+			DegreesLatitude:  &message.Location.Latitude,
 			DegreesLongitude: &message.Location.Longitude,
 			AccuracyInMeters: ptrTo(uint32(message.Location.Accuracy)),
-			ContextInfo: contextInfo,
+			ContextInfo:      contextInfo,
 		}}
 	}
 
@@ -854,7 +879,9 @@ func (s *Session) GetContacts(refresh bool) ([]Contact, error) {
 	for _, contact := range contactsByJID {
 		contacts = append(contacts, contact)
 	}
-	if s.currentClient() != client { return nil, fmt.Errorf("roster session changed") }
+	if s.currentClient() != client {
+		return nil, fmt.Errorf("roster session changed")
+	}
 	return contacts, nil
 }
 
@@ -906,7 +933,9 @@ func (s *Session) GetGroups() ([]Group, error) {
 		groups = append(groups, newGroup(ctx, client, info))
 	}
 
-	if s.currentClient() != client { return nil, fmt.Errorf("roster session changed") }
+	if s.currentClient() != client {
+		return nil, fmt.Errorf("roster session changed")
+	}
 	return groups, nil
 }
 
@@ -1202,7 +1231,7 @@ func shouldDropTransientEvent(kind EventKind, payload *EventPayload) bool {
 // PropagateEvent handles the given event kind and payload with the adapter event handler defined in
 // [Session.SetEventHandler].
 func (s *Session) propagateEvent(kind EventKind, payload *EventPayload) {
-    s.canQueuePayload(kind, payload)
+	s.canQueuePayload(kind, payload)
 }
 
 // HandleEvent processes the given incoming WhatsApp event, checking its concrete type and
@@ -1213,6 +1242,7 @@ func (s *Session) handleEvent(evt any) {
 	if client == nil {
 		return
 	}
+	voicecore.Dispatch(client, evt)
 	s.canTraceCallSignal(evt)
 	s.gateway.logger.Debugf("Handling event '%T': %+v", evt, jsonStringer{evt})
 
@@ -1263,13 +1293,15 @@ func (s *Session) handleEvent(evt any) {
 			s.gateway.logger.Warnf("Failed to send available presence: %s", err)
 		}
 	case *events.HistorySync:
-        ctx := s.ctx
-        d := s.canGetInbound()
-        d.enqueue(d.history, func(){
-            if ctx.Err()==nil && s.currentClient()==client { s.canHandleHistory(ctx,client,evt) }
-        }, false)
-    case *events.Message:
-        s.canQueueMessage(s.ctx,client,evt)
+		ctx := s.ctx
+		d := s.canGetInbound()
+		d.enqueue(d.history, func() {
+			if ctx.Err() == nil && s.currentClient() == client {
+				s.canHandleHistory(ctx, client, evt)
+			}
+		}, false)
+	case *events.Message:
+		s.canQueueMessage(s.ctx, client, evt)
 	case *events.Receipt:
 		s.propagateEvent(newReceiptEvent(s.ctx, client, evt))
 	case *events.MarkChatAsRead:
@@ -1432,38 +1464,42 @@ func (s *Session) MarkChatRead(receipt Receipt) error {
 	})
 }
 
-func (s *Session) canHandleHistory(ctx context.Context, client *whatsmeow.Client, evt *events.HistorySync) {
-
-    emit:=func(kind EventKind,payload *EventPayload){
-        if ctx.Err()==nil && s.currentClient()==client {
-            if kind==EventCall && payload!=nil { s.canObserveCall(payload) }
-            s.canDeliverInbound(kind,payload)
-        }
-    }
-		for _, record := range evt.Data.GetCallLogRecords() {
-			kind, payload := newCallLogRecordEvent(ctx, client, record, "history_sync")
-			if payload != nil {
-				emit(kind, payload)
-			}
-		}
-		switch evt.Data.GetSyncType() {
-		case waHistorySync.HistorySync_PUSH_NAME:
-			for _, n := range evt.Data.GetPushnames() {
-				emit(newContactEventFromHistory(ctx, client, n))
-			}
-		case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT, waHistorySync.HistorySync_ON_DEMAND:
-			for _, c := range evt.Data.GetConversations() {
-				for _, msg := range c.GetMessages() {
-					if ctx.Err()!=nil || s.currentClient()!=client { return }
-					emit(newEventFromHistory(ctx, client, msg.GetMessage()))
-				}
-			}
-		}
-
-}
-
 // canLinkQRPayload preserves WhatsMeow's per-code expiry across the existing gopy API.
 func canLinkQRPayload(code string, ttl time.Duration) string {
-    data, _ := json.Marshal(map[string]any{"code": code, "ttl": ttl.Seconds()})
-    return string(data)
+	data, _ := json.Marshal(map[string]any{"code": code, "ttl": ttl.Seconds()})
+	return string(data)
+}
+
+func (s *Session) canHandleHistory(ctx context.Context, client *whatsmeow.Client, evt *events.HistorySync) {
+
+	emit := func(kind EventKind, payload *EventPayload) {
+		if ctx.Err() == nil && s.currentClient() == client {
+			if kind == EventCall && payload != nil {
+				s.canObserveCall(payload)
+			}
+			s.canDeliverInbound(kind, payload)
+		}
+	}
+	for _, record := range evt.Data.GetCallLogRecords() {
+		kind, payload := newCallLogRecordEvent(ctx, client, record, "history_sync")
+		if payload != nil {
+			emit(kind, payload)
+		}
+	}
+	switch evt.Data.GetSyncType() {
+	case waHistorySync.HistorySync_PUSH_NAME:
+		for _, n := range evt.Data.GetPushnames() {
+			emit(newContactEventFromHistory(ctx, client, n))
+		}
+	case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT, waHistorySync.HistorySync_ON_DEMAND:
+		for _, c := range evt.Data.GetConversations() {
+			for _, msg := range c.GetMessages() {
+				if ctx.Err() != nil || s.currentClient() != client {
+					return
+				}
+				emit(newEventFromHistory(ctx, client, msg.GetMessage()))
+			}
+		}
+	}
+
 }

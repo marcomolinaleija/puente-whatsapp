@@ -165,7 +165,7 @@ class MessageArchive:
         flip: bool = False,
     ) -> Iterator[HistoryMessage]:
         with self.__store.session() as orm:
-            yield from self.__store.get_messages(
+            messages = list(self.__store.get_messages(
                 orm,
                 self.room.id,
                 before_id=before_id,
@@ -176,7 +176,10 @@ class MessageArchive:
                 start_date=start_date,
                 end_date=end_date,
                 flip=flip,
-            )
+            ))
+        # CAN detached archive reads v2
+        # HistoryMessage holds XML/scalars, never lazy ORM objects.
+        yield from messages
 
     async def send_metadata(self, iq: Iq) -> None:
         """

@@ -392,7 +392,21 @@ class LegacyParticipant(
                 stanza.send()
         else:
             if hasattr(self.muc, "archive") and isinstance(stanza, Message):
-                self.muc.archive.add(stanza, self, archive_only, legacy_msg_id)
+                # CAN ordered participant archive delivery v2
+                # Snapshot the stanza now; the synchronous public API still returns it.
+                snapshot = copy(stanza)
+                archive = self.muc.archive
+                pending = getattr(archive, "_can_pending_deliveries", None)
+                if pending is None:
+                    pending = archive._can_pending_deliveries = set()
+                task = self.xmpp.loop.create_task(
+                    self._can_archive_and_send(snapshot, archive_only, legacy_msg_id)
+                )
+                pending.add(task)
+                from slidge.can_archive_delivery import track
+                track(task)
+                task.add_done_callback(pending.discard)
+                return stanza
             if archive_only:
                 return stanza
             for user_full_jid in self.muc.user_full_jids():
@@ -401,6 +415,25 @@ class LegacyParticipant(
                 self.__send_presence_if_needed(stanza, user_full_jid, archive_only)
                 stanza.send()
         return stanza
+
+    async def _can_archive_and_send(self, stanza, archive_only, legacy_msg_id):
+        # Share the R6 echo lock so receipts, incoming messages and own echoes
+        # keep archive-before-send ordering, even when SQL waits for a reader.
+        try:
+            async with self.session.lock(("can-group-echo", str(self.muc.jid))):
+                await self.muc.archive.add_async(stanza, self, archive_only, legacy_msg_id)
+                if not archive_only:
+                    for full_jid in self.muc.user_full_jids():
+                        outgoing = copy(stanza)
+                        outgoing["to"] = full_jid
+                        self.__send_presence_if_needed(outgoing, full_jid, False)
+                        outgoing.send()
+        except Exception as exc:
+            # No resending on uncertain outcomes. Surface a durable local failure
+            # to the bounded functional watchdog, without logging message content.
+            self.xmpp._can_archive_failed = True
+            self.xmpp.log.error("CAN archive delivery failed: %s", type(exc).__name__)
+            raise
 
     def mucadmin_item(self) -> MUCAdminItem:
         item = MUCAdminItem()

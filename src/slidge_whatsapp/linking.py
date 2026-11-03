@@ -14,6 +14,31 @@ from xml.etree import ElementTree as ET
 NAMESPACE = "urn:can:whatsapp:linking:1"
 LOGIN_TIMEOUT = 190
 TERMINAL = {"canceled", "expired", "connection_error", "logged_out", "needs_pairing"}
+ROSTER_RATE_LIMIT_MIN = 300
+ROSTER_RATE_LIMIT_MAX = 1800
+
+
+class RosterRateLimited(RuntimeError):
+    """A group-list request is cooling down; no new request was sent."""
+
+    def __init__(self, retry_after):
+        super().__init__("WhatsApp group list rate limited")
+        self.retry_after = retry_after
+
+
+def roster_retry_after(error, previous=0):
+    if isinstance(error, RosterRateLimited):
+        return error.retry_after
+    # Match the native query rejection, not every error mentioning 429.
+    text = str(error).lower()
+    if "status 429: rate-overlimit" in text:
+        return min(max(previous * 2, ROSTER_RATE_LIMIT_MIN), ROSTER_RATE_LIMIT_MAX)
+    return 0
+
+
+def readiness_succeeded(future):
+    return (future is not None and future.done() and not future.cancelled()
+            and future.exception() is None and bool(future.result()))
 
 
 class LinkingError(Exception):
@@ -45,6 +70,7 @@ class LinkingSession:
         self.mode = "qr"
         self.sync_error = False
         self.sync_task = None
+        self.sync_retry_after = 0
         self.phone_code = ""
         self.phone_fingerprint = ""
 
@@ -65,16 +91,23 @@ class LinkingSession:
         self.authenticated = False
         self.mode = "qr"
         self.sync_error = False
+        self.sync_retry_after = 0
         self.change("connecting")
 
-    def retry_sync(self):
+    def retry_sync(self, error=None):
+        if error is not None:
+            self.sync_retry_after = max(self.sync_retry_after, roster_retry_after(error))
         if (self.sync_task is not None and not self.sync_task.done()
                 and not self.sync_task.cancelling()):
             return
         attempt = self.attempt
 
         async def retry():
-            for delay in (30, 60, 120):
+            failures = 0
+            while failures < 3:
+                # Only a known rate limit has slow ongoing recovery. Other
+                # errors retain the existing three-attempt budget.
+                delay = self.sync_retry_after or (30, 60, 120)[failures]
                 await asyncio.sleep(delay)
                 if not self.authenticated or attempt != self.attempt:
                     return
@@ -100,18 +133,22 @@ class LinkingSession:
                     required = [contacts.ready]
                     if self.session.xmpp.GROUPS:
                         required.append(groups.ready)
-                    if any(not f.done() or f.cancelled() or f.exception() is not None
-                           or not f.result() for f in required):
+                    if not all(readiness_succeeded(f) for f in required):
                         raise RuntimeError("Roster readiness was cancelled or failed")
                     self.session.send_gateway_status("Logged in", show="chat")
                     self.sync_error = False
+                    self.sync_retry_after = 0
                     self.revision += 1
                     return
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
+                    self.sync_retry_after = roster_retry_after(exc, self.sync_retry_after)
+                    if not self.sync_retry_after:
+                        failures += 1
                     logging.getLogger(__name__).warning(
-                        "WhatsApp roster sync retry failed", exc_info=True,
+                        "WhatsApp roster sync retry failed; cooldown=%ss",
+                        self.sync_retry_after, exc_info=not self.sync_retry_after,
                     )
             # Exhaustion remains visible as sync=error; never acknowledge completion.
 
@@ -128,7 +165,7 @@ class LinkingSession:
             groups = getattr(getattr(self.session, "bookmarks", None), "ready", None)
             if self.sync_error:
                 sync = "error"
-            elif contacts is not None and contacts.done() and groups is not None and groups.done():
+            elif readiness_succeeded(contacts) and readiness_succeeded(groups):
                 sync = "ready"
             else:
                 sync = "syncing"
@@ -399,15 +436,16 @@ def install(gateway):
             else:
                 state(session).sync_error = False
             return result
-        except Exception:
+        except Exception as exc:
             owner = state(session)
             if owner.authenticated:
                 owner.sync_error = True
                 owner.revision += 1
                 logging.getLogger(__name__).warning(
-                    "WhatsApp authenticated; initial roster sync failed, retrying", exc_info=True,
+                    "WhatsApp authenticated; initial roster sync failed, retrying",
+                    exc_info=not roster_retry_after(exc),
                 )
-                owner.retry_sync()
+                owner.retry_sync(exc)
                 return "WhatsApp conectado; sincronización pendiente."
             raise
         finally:

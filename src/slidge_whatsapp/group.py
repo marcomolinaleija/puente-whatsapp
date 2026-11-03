@@ -9,6 +9,7 @@ from slidge.util.types import Hat, HoleBound, MucAffiliation, XMPPMessage
 from slixmpp.exceptions import XMPPError
 
 from .generated import go, whatsapp
+from .linking import RosterRateLimited, roster_retry_after
 from .mixins import AvatarMixin, RecipientMixin, strip_quote_prefix
 
 if TYPE_CHECKING:
@@ -334,10 +335,46 @@ class Bookmarks(LegacyBookmarks[MUC]):
     session: "Session"
 
     async def fill(self) -> None:
-        # CAN nonblocking group fill v1
-        groups = await asyncio.to_thread(lambda: list(self.session.whatsapp.GetGroups()))
-        for group in groups:
-            await self.add_whatsapp_group(group)
+        # One native request per account, including when an awaiting login is
+        # cancelled: cancelling to_thread does not stop its native worker.
+        task = getattr(self, "_can_group_fill_task", None)
+        if task is not None and not task.done():
+            return await asyncio.shield(task)
+        loop = asyncio.get_running_loop()
+        remaining = getattr(self, "_can_group_retry_at", 0) - loop.time()
+        if remaining > 0:
+            raise RosterRateLimited(remaining)
+        owner = getattr(self.session, "_can_linking", None)
+        attempt = owner.attempt if owner is not None else None
+        if (loop.time() < getattr(self, "_can_group_filled_until", 0)
+                and getattr(self, "_can_group_filled_attempt", None) == attempt):
+            return
+
+        async def fetch():
+            try:
+                groups = await asyncio.to_thread(lambda: list(self.session.whatsapp.GetGroups()))
+            except RuntimeError as exc:
+                delay = roster_retry_after(exc, getattr(self, "_can_group_backoff", 0))
+                if not delay:
+                    raise
+                self._can_group_backoff = delay
+                self._can_group_retry_at = loop.time() + delay
+                raise RosterRateLimited(delay) from None
+            for group in groups:
+                if owner is not None and (not owner.authenticated or owner.attempt != attempt):
+                    raise RuntimeError("Roster session changed")
+                await self.add_whatsapp_group(group)
+            if owner is not None and (not owner.authenticated or owner.attempt != attempt):
+                raise RuntimeError("Roster session changed")
+            self._can_group_backoff = self._can_group_retry_at = 0
+            # Coalesce repeated login wrappers, not future explicit refreshes.
+            self._can_group_filled_attempt = attempt
+            self._can_group_filled_until = loop.time() + 300
+
+        task = self._can_group_fill_task = asyncio.create_task(fetch())
+        # Retrieve failures even if all waiters were cancelled during teardown.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        await asyncio.shield(task)
 
     async def add_whatsapp_group(self, data: whatsapp.Group) -> None:
         muc = await self.by_legacy_id(data.JID)

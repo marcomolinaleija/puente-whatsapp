@@ -79,5 +79,5 @@ COPY --from=inbound-probe-tests /tmp/inbound-result.json /usr/share/can-bridge/i
 ARG VCS_REF=uncommitted
 LABEL org.opencontainers.image.source="https://github.com/marcomolinaleija/puente-whatsapp" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.version="37" \
+      org.opencontainers.image.version="38" \
       org.can.whatsapp.web-version="2.3000.1052556849"

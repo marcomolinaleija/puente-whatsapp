@@ -1,12 +1,14 @@
 from __future__ import annotations
 import asyncio
-import base64
 import json
-import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
-from slidge_whatsapp.linking import LinkingError, LinkingSession, install, install_session, state
+from slidge_whatsapp.linking import (
+    LinkingError, LinkingSession, RosterRateLimited, install, install_session,
+    roster_retry_after, state,
+)
+from slidge_whatsapp.group import Bookmarks
 
 PNG = b"\x89PNG\r\n\x1a\nfictional"
 
@@ -239,6 +241,94 @@ class LinkingSyncRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(getattr(owner, "sync_task", None))
         self.assertFalse(session.is_logging_in)
 
+    async def test_rate_limit_recovers_after_old_budget_with_capped_slow_retries(self):
+        gateway, session, owner, original = self.gateway()
+        session.bookmarks.fill.side_effect = [
+            RuntimeError("failed getting groups: info query returned status 429: rate-overlimit")
+        ] * 6 + [None]
+        sleep = AsyncMock()
+        with patch("slidge_whatsapp.linking.asyncio.sleep", sleep):
+            await gateway.login_wrap(session)
+            self.assertEqual(owner.snapshot()["sync"], "error")
+            await owner.sync_task
+        self.assertEqual([c.args[0] for c in sleep.await_args_list],
+                         [300, 600, 1200, 1800, 1800, 1800])
+        self.assertEqual(owner.snapshot()["sync"], "ready")
+        session.contacts._fill.assert_not_awaited()
+        self.assertEqual(session.bookmarks.fill.await_count, 7)
+        original.assert_awaited_once()
+
+    async def test_rate_limit_preserves_cooldown_and_cancels_on_disconnect(self):
+        gateway, session, owner, original = self.gateway()
+        session.bookmarks.fill.side_effect = RosterRateLimited(900)
+        entered = asyncio.Event()
+
+        async def sleep(delay):
+            self.assertEqual(delay, 900)
+            entered.set()
+            await asyncio.Event().wait()
+
+        with patch("slidge_whatsapp.linking.asyncio.sleep", side_effect=sleep):
+            await gateway.login_wrap(session)
+            task = owner.sync_task
+            owner.retry_sync()
+            self.assertIs(owner.sync_task, task)
+            await entered.wait()
+            self.assertEqual(owner.snapshot()["sync"], "error")
+            owner.authenticated = False
+            owner.change("connecting", "disconnected")
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.cancelled())
+        self.assertFalse(session.bookmarks.ready.done())
+        session.bookmarks.fill.assert_awaited_once()
+        original.assert_awaited_once()
+
+    async def test_real_group_fill_recovers_readiness_after_repeated_native_429(self):
+        gateway, session, owner, original = self.gateway()
+        session.whatsapp = SimpleNamespace(GetGroups=Mock(side_effect=[RuntimeError(
+            "failed getting groups: info query returned status 429: rate-overlimit"
+        )] * 4 + [["fictional-group"]]))
+        session.bookmarks.session = session
+        session.bookmarks.add_whatsapp_group = AsyncMock()
+
+        async def fill():
+            await Bookmarks.fill(session.bookmarks)
+
+        session.bookmarks.fill.side_effect = fill
+        delays = []
+
+        async def sleep(delay):
+            self.assertFalse(session.bookmarks.ready.done())
+            self.assertEqual(owner.snapshot()["sync"], "error")
+            delays.append(delay)
+            # Advance only the private cooldown, never the event loop clock.
+            session.bookmarks._can_group_retry_at = 0
+
+        with patch("slidge_whatsapp.linking.asyncio.sleep", side_effect=sleep):
+            await gateway.login_wrap(session)
+            await owner.sync_task
+        self.assertEqual(delays, [300, 600, 1200, 1800])
+        self.assertEqual(owner.snapshot()["sync"], "ready")
+        self.assertEqual(session.whatsapp.GetGroups.call_count, 5)
+        session.bookmarks.add_whatsapp_group.assert_awaited_once_with("fictional-group")
+        original.assert_awaited_once()
+
+    async def test_only_exact_rate_limit_gets_slow_recovery(self):
+        for message in ("status 429: other", "rate-overlimit", "fixture timeout 429"):
+            self.assertEqual(roster_retry_after(RuntimeError(message)), 0)
+
+    async def test_snapshot_does_not_acknowledge_failed_or_cancelled_futures(self):
+        for failure in ("cancel", "exception", "false"):
+            with self.subTest(failure=failure):
+                _, session, owner, _ = self.gateway()
+                if failure == "cancel":
+                    session.bookmarks.ready.cancel()
+                elif failure == "exception":
+                    session.bookmarks.ready.set_exception(RuntimeError("fixture"))
+                else:
+                    session.bookmarks.ready.set_result(False)
+                self.assertNotEqual(owner.snapshot()["sync"], "ready")
+
     async def test_retries_are_bounded_and_exhaustion_stays_in_error(self):
         gateway, session, owner, original = self.gateway(failures=4)
         sleep = AsyncMock()
@@ -315,6 +405,95 @@ class LinkingSyncRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(owner.sync_task)
         self.assertFalse(owner.sync_error)
         original.assert_awaited_once()
+
+class GroupListRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def bookmarks(self):
+        session = SimpleNamespace(whatsapp=SimpleNamespace(GetGroups=Mock(return_value=[])))
+        owner = state(session)
+        owner.authenticated = True
+        owner.attempt = "fictional-attempt"
+        return SimpleNamespace(session=session, add_whatsapp_group=AsyncMock())
+
+    async def test_duplicate_fill_and_cancelled_waiter_share_native_work(self):
+        groups = self.bookmarks()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def native(_):
+            entered.set()
+            await release.wait()
+            return ["fictional-group"]
+
+        with patch("slidge_whatsapp.group.asyncio.to_thread", side_effect=native) as worker:
+            first = asyncio.create_task(Bookmarks.fill(groups))
+            await entered.wait()
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            second = asyncio.create_task(Bookmarks.fill(groups))
+            release.set()
+            await second
+            await Bookmarks.fill(groups)
+        worker.assert_awaited_once()
+        groups.add_whatsapp_group.assert_awaited_once_with("fictional-group")
+
+    async def test_rate_limit_cooldown_no_extra_queries_and_account_isolation(self):
+        groups, other = self.bookmarks(), self.bookmarks()
+        groups.session.whatsapp.GetGroups.side_effect = RuntimeError(
+            "failed getting groups: info query returned status 429: rate-overlimit")
+        for delay in (300, 600, 1200, 1800, 1800):
+            groups._can_group_retry_at = 0
+            with self.assertRaises(RosterRateLimited) as caught:
+                await Bookmarks.fill(groups)
+            self.assertEqual(caught.exception.retry_after, delay)
+            self.assertFalse(hasattr(groups, "_can_group_filled_until"))
+            calls = groups.session.whatsapp.GetGroups.call_count
+            with self.assertRaises(RosterRateLimited):
+                await Bookmarks.fill(groups)
+            self.assertEqual(groups.session.whatsapp.GetGroups.call_count, calls)
+        await Bookmarks.fill(other)
+        other.session.whatsapp.GetGroups.assert_called_once()
+        groups.session.whatsapp.GetGroups.side_effect = None
+        groups._can_group_retry_at = 0
+        await Bookmarks.fill(groups)
+        self.assertEqual(groups._can_group_backoff, 0)
+        self.assertEqual(groups._can_group_retry_at, 0)
+
+    async def test_success_cache_expires_and_is_not_reused_by_new_attempt(self):
+        groups = self.bookmarks()
+        await Bookmarks.fill(groups)
+        await Bookmarks.fill(groups)
+        self.assertEqual(groups.session.whatsapp.GetGroups.call_count, 1)
+        groups._can_group_filled_until = 0
+        await Bookmarks.fill(groups)
+        self.assertEqual(groups.session.whatsapp.GetGroups.call_count, 2)
+        groups.session._can_linking.attempt = "fictional-new-attempt"
+        await Bookmarks.fill(groups)
+        self.assertEqual(groups.session.whatsapp.GetGroups.call_count, 3)
+
+    async def test_cancelled_attempt_cannot_apply_native_result_or_cache_success(self):
+        for action in ("disconnect", "new_attempt"):
+            with self.subTest(action=action):
+                groups = self.bookmarks()
+
+                async def native(_, groups=groups, action=action):
+                    if action == "disconnect":
+                        groups.session._can_linking.authenticated = False
+                    else:
+                        groups.session._can_linking.attempt = "replacement"
+                    return ["fictional-group"]
+
+                with patch("slidge_whatsapp.group.asyncio.to_thread", side_effect=native):
+                    with self.assertRaisesRegex(RuntimeError, "Roster session changed"):
+                        await Bookmarks.fill(groups)
+                groups.add_whatsapp_group.assert_not_awaited()
+                self.assertFalse(hasattr(groups, "_can_group_filled_until"))
+
+    async def test_unrelated_failure_keeps_its_type_and_does_not_start_cooldown(self):
+        groups = self.bookmarks()
+        groups.session.whatsapp.GetGroups.side_effect = ValueError("fictional error")
+        with self.assertRaisesRegex(ValueError, "fictional error"):
+            await Bookmarks.fill(groups)
+        self.assertFalse(hasattr(groups, "_can_group_retry_at"))
+
 
 if __name__ == "__main__":
     unittest.main()

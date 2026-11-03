@@ -81,6 +81,27 @@ smokes del runtime y un probe nativo de recepción. BuildKit no puede omitirlos 
 construir ese target. El probe inyectado sólo existe en una variante de prueba;
 el binario distribuido no lo contiene. No se ejecutan tests del cliente CAN.
 
+### Recuperación de la lista de grupos
+
+Si WhatsApp rechaza `GetGroups` con `status 429: rate-overlimit`, la sesión
+permanece vinculada y la recuperación espera 5, 10, 20 y luego 30 minutos entre
+consultas. El intervalo queda limitado a 30 minutos mientras la cuenta siga
+autenticada; los demás errores conservan el máximo de tres reintentos.
+
+Las llamadas concurrentes por cuenta comparten una sola tarea nativa, incluso
+si se cancela uno de sus consumidores. Un resultado completo se reutiliza cinco
+minutos sólo dentro del mismo intento de sesión. Los fallos no se guardan como
+éxito ni habilitan la barrera de grupos; cancelar o cambiar la sesión invalida
+los resultados tardíos. Desconectar cancela la recuperación en segundo plano.
+
+`sync=error` no implica desvinculación, pero tampoco garantiza recepción: los
+callbacks de datos esperan a que terminen las barreras de contactos y grupos.
+La salud del contenedor verifica XMPP/archivo, no la sincronización de WhatsApp.
+La v38 integra estas fuentes en la imagen. La corrección se probó primero como
+parche Python de sólo lectura sobre v37, sin cambiar el binario nativo. Esa
+validación previa no sustituye las barreras del target `release` para publicar
+la nueva imagen.
+
 ### Confirmación de estados de WhatsApp
 
 El build incorpora el [parche upstream de nodos `status`](https://github.com/tulir/whatsmeow/commit/a2381054887e16d22428430fdc4d2b027a7f29a7)

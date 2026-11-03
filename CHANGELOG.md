@@ -1,5 +1,31 @@
 # Publicaciones del puente
 
+## v38 — 3 de noviembre de 2026
+
+Imagen `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v38`, plataforma `linux/amd64`.
+Digest: `sha256:f0642ecaf96c13b9126d479ea64d9b0036484beba67fc232aa3d24a541c36a94`.
+Código construido: [3ab5eaa](https://github.com/marcomolinaleija/puente-whatsapp/commit/3ab5eaa7ac3827f2407a78311cddbfec6738d655).
+
+- Recupera la carga inicial de grupos rechazada con `429: rate-overlimit` sin
+  desvincular WhatsApp. Espera 5, 10, 20 y luego 30 minutos entre consultas mientras
+  la cuenta siga autenticada; otros errores conservan el máximo de tres reintentos.
+- Comparte una sola consulta nativa por cuenta y conserva el cooldown aunque se
+  cancele un consumidor. Reutiliza resultados completos cinco minutos por intento.
+- No marca la sincronización como lista ante errores, cancelaciones ni resultados
+  de una sesión obsoleta. Conserva el binario nativo, el ACK de estados y la voz.
+
+El target `release` aprobó 216 casos Go y los mismos con `race`, cifrado de stickers
+y ACK normal/race, las 23 comprobaciones del runtime (incluidas 27 pruebas de
+vinculación y recuperación) y el probe de 200 mensajes entre dos cuentas ficticias
+con dos historiales bloqueados. Se mantienen los dos skips upstream del códec.
+El binario nativo conserva SHA-256
+`7402034c5de5766c9f8f5ef0b3464f4a9ea064fa8e390fa5e1ec46208c0cdfa4`.
+
+La corrección recibió confirmación humana como parche sobre v37. Esto no sustituye
+la prueba humana específica posterior a instalar la imagen v38. La publicación
+verificó pull anónimo por digest, configuración y disponibilidad de las 85 capas.
+No se construyó ni modificó la aplicación CAN.
+
 ## v37 — 3 de noviembre de 2026
 
 Imagen `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v37`, plataforma `linux/amd64`.

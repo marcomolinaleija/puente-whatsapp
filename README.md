@@ -1,5 +1,8 @@
 # Puente WhatsApp CAN
 
+Versión publicada: **v36**. Consulta `release-manifest.json` para la imagen y el
+digest verificados, y [CHANGELOG.md](CHANGELOG.md) para los cambios y sus pruebas.
+
 Fuente de trabajo para el puente entre XMPP y WhatsApp. El código inicial se recuperó
 de la imagen pública `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v35`, digest
 `sha256:5cc36c7f2d1cfc08632f6d6e88cd38c009138915069fc0de282c3a43c60de86e`.

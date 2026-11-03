@@ -12,16 +12,20 @@ ROOT = Path(__file__).resolve().parent
 def main() -> None:
     reports = {}
     required = {"TestCANWhatsAppWebBaseline", "TestCANInviteLinkIsOnlyMessageData"}
-    for name in ("go.jsonl", "race.jsonl", "sticker-go.jsonl"):
+    for name in ("go.jsonl", "race.jsonl", "sticker-go.jsonl", "status-race.jsonl"):
         rows = [json.loads(line) for line in (ROOT / name).read_text().splitlines()]
         assert not any(row.get("Action") == "fail" for row in rows), name
         passed = {(row["Package"], row["Test"]) for row in rows
                   if row.get("Action") == "pass" and row.get("Test")}
         assert passed, name
-        if name != "sticker-go.jsonl":
+        if name in {"go.jsonl", "race.jsonl"}:
             root_cases = {test for package, test in passed
                           if package == "codeberg.org/slidge/slidge-whatsapp/slidge_whatsapp"}
             assert required <= root_cases, f"Missing current native regressions: {name}"
+        else:
+            assert "TestCANStatusNodesAcknowledged" in {test for _, test in passed}, (
+                f"Missing real status ACK regression: {name}"
+            )
         reports[name] = {
             "passed": len(passed),
             "skipped": [{"package": row["Package"], "test": row.get("Test")}

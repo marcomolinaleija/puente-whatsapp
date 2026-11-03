@@ -81,6 +81,21 @@ smokes del runtime y un probe nativo de recepción. BuildKit no puede omitirlos 
 construir ese target. El probe inyectado sólo existe en una variante de prueba;
 el binario distribuido no lo contiene. No se ejecutan tests del cliente CAN.
 
+### Confirmación de estados de WhatsApp
+
+El build incorpora el [parche upstream de nodos `status`](https://github.com/tulir/whatsmeow/commit/a2381054887e16d22428430fdc4d2b027a7f29a7)
+sobre la dependencia fijada, sin actualizar el resto de Whatsmeow ni el backend
+de voz. Los estados válidos reciben un ACK normal; los malformados conservan el
+NACK de análisis y los canales conservan su procesamiento de mensajes.
+
+`build/patch_whatsmeow_status.py` comprueba los hashes de los tres archivos
+upstream antes de modificarlos y rechaza versiones desconocidas. La regresión
+`TestCANStatusNodesAcknowledged` verifica el envío serializado de ACK para texto,
+multimedia y estados pendientes, y el NACK del caso malformado, sin red ni cuentas
+reales. El target `release` exige esa regresión tanto normal como con `-race`.
+Este cambio de fuentes no modifica la imagen v36 ya publicada; la recepción real
+y la estabilidad tras el despliegue requieren validación aparte.
+
 La migración de voz conserva las licencias MIT de WaCalls y MLow, junto a la
 licencia AGPL de Slidge. Se incluyen las tres tablas binarias del códec. Los 19
 vectores públicos de prueba se descargan sólo en el stage aislado de tests:

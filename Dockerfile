@@ -14,6 +14,8 @@ WORKDIR /src/slidge_whatsapp
 ENV GOTOOLCHAIN=local GOMAXPROCS=2 GOMEMLIMIT=2GiB GOFLAGS=-mod=mod
 RUN go mod vendor
 COPY src-overrides/whatsmeow/ /src/slidge_whatsapp/vendor/go.mau.fi/whatsmeow/
+COPY build/patch_whatsmeow_status.py /opt/can-build/
+RUN python3 -S -B /opt/can-build/patch_whatsmeow_status.py /src/slidge_whatsapp/vendor/go.mau.fi/whatsmeow
 ENV GOFLAGS=-mod=vendor
 RUN --network=none cd generated && go build -p 2 -buildmode=c-shared -tags "mupdf extlib" \
     -ldflags="-s -w -extldflags=-Wl,--version-script=/opt/can-build/gopy_whatsapp_exports.map" \
@@ -24,8 +26,10 @@ COPY tests/go/ /src/slidge_whatsapp/
 COPY tests/whatsmeow/ /src/slidge_whatsapp/vendor/go.mau.fi/whatsmeow/
 COPY build/fetch_codec_testdata.py build/voice-upstream.json build/voice-fixtures.sha256 /opt/can-build/
 RUN python3 -S -B /opt/can-build/fetch_codec_testdata.py
-RUN --network=none (go test -p 2 -json go.mau.fi/whatsmeow -run '^TestCANStickerPackThumbnailEncryption$' > /tmp/sticker-go.jsonl; echo $? > /tmp/sticker-go.status) && \
+RUN --network=none (go test -p 2 -json go.mau.fi/whatsmeow -run '^TestCAN(StickerPackThumbnailEncryption|StatusNodesAcknowledged)$' > /tmp/sticker-go.jsonl; echo $? > /tmp/sticker-go.status) && \
     python3 /opt/can-build/check_go_report.py /tmp/sticker-go.jsonl "$(cat /tmp/sticker-go.status)" && \
+    (go test -p 2 -json -race go.mau.fi/whatsmeow -run '^TestCANStatusNodesAcknowledged$' > /tmp/status-race.jsonl; echo $? > /tmp/status-race.status) && \
+    python3 /opt/can-build/check_go_report.py /tmp/status-race.jsonl "$(cat /tmp/status-race.status)" && \
     (CAN_CALL_FIXTURE=/tmp/call-history-fixture.json go test -p 2 -json . ./voicecore/... > /tmp/go.jsonl; echo $? > /tmp/go.status) && \
     python3 /opt/can-build/check_go_report.py /tmp/go.jsonl "$(cat /tmp/go.status)" && \
     (go test -p 2 -json -race . ./voicecore/... > /tmp/race.jsonl; echo $? > /tmp/race.status) && \
@@ -49,7 +53,7 @@ USER root
 COPY tests/runtime/ /opt/can-tests/
 COPY build/run_runtime_checks.py /opt/can-tests/
 COPY deploy/slidge-watchdog /opt/can-tests/slidge-watchdog
-COPY --chown=slidge:slidge --from=go-tests /tmp/go.jsonl /tmp/race.jsonl /tmp/sticker-go.jsonl /tmp/call-history-fixture.json /opt/can-tests/
+COPY --chown=slidge:slidge --from=go-tests /tmp/go.jsonl /tmp/race.jsonl /tmp/sticker-go.jsonl /tmp/status-race.jsonl /tmp/call-history-fixture.json /opt/can-tests/
 USER slidge
 RUN --network=none python -B /opt/can-tests/run_runtime_checks.py
 
@@ -75,5 +79,5 @@ COPY --from=inbound-probe-tests /tmp/inbound-result.json /usr/share/can-bridge/i
 ARG VCS_REF=uncommitted
 LABEL org.opencontainers.image.source="https://github.com/marcomolinaleija/puente-whatsapp" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.version="36" \
+      org.opencontainers.image.version="37" \
       org.can.whatsapp.web-version="2.3000.1052556849"

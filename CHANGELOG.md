@@ -1,5 +1,33 @@
 # Publicaciones del puente
 
+## v39 — 16 de noviembre de 2026
+
+Imagen `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v39`, plataforma `linux/amd64`.
+Digest: `sha256:016af7dc331cb2bd173449485e49638123814acbb497dda3e742f8f09a3fb5b6`.
+Código construido: [b4002ba](https://github.com/marcomolinaleija/puente-whatsapp/commit/b4002bac218f94a595cf46896b72071e0b8d0758).
+
+- Admite los asistentes de WhatsApp: Meta AI y sus personas usan su alias
+  telefónico documentado; los bots sin alias, como Muse, su identidad `@bot`
+  (`+bot.<id>` en XMPP). Muse se añade al roster cuando la cuenta lo usa.
+- Porta de whatsmeow `ecc39170bc14` el cifrado WASA de Muse. El secreto raíz se
+  lee de la app state sin escribir versiones ni repetir eventos, y también se
+  guarda al recibir su distribución en vivo.
+- Las respuestas en streaming llegan como un mensaje y una corrección final, sin
+  correcciones vacías. Las respuestas enriquecidas incluyen su texto, enlaces y
+  sugerencias como listas legibles.
+- Las solicitudes de aprobación de Muse se muestran con su pregunta, detalles,
+  opciones y estado, y pueden responderse desde el cliente (`hitl.approval.decide`):
+  sólo pendientes, sólo opciones ofrecidas y una única respuesta por solicitud.
+- Backport de whatsmeow: etapa `full` de los bots y reintento de descifrado con
+  el ID propio del mensaje.
+
+El target `release` aprobó las pruebas Go y Go/race (incluidas las nuevas de Meta
+AI, WASA y aprobaciones), cifrado de stickers, ACK de estados, las comprobaciones
+del runtime y el probe de entrada. La publicación comprobó que no existía `v39`
+ni etiquetas posteriores a `v38`, y verificó el manifiesto anónimo por digest.
+Las respuestas, sugerencias y aprobaciones de Muse (permitir y denegar) se
+validaron con una cuenta real antes de publicar.
+
 ## v38 — 3 de noviembre de 2026
 
 Imagen `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v38`, plataforma `linux/amd64`.

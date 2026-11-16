@@ -465,6 +465,16 @@ func newMessageEvent(ctx context.Context, client *whatsmeow.Client, evt *events.
 	message.Chat = newChat(ctx, client, evt.Info.Chat, evt.Info.IsGroup)
 	message.Actor.IsMe = evt.Info.IsFromMe
 
+	// CAN Meta AI v1: map assistant identities and collapse streamed answers.
+	if canIsBotMessage(evt) {
+		var kind EventKind
+		var payload *EventPayload
+		var handled bool
+		if evt, kind, payload, handled = canBotMessageEvent(client, evt, &message); handled {
+			return kind, payload
+		}
+	}
+
 	if evt.Info.Chat.Server == types.BroadcastServer {
 		// Handle non-carbon, non-status broadcast messages as plain messages; support for other
 		// types is lacking in the XMPP world.
@@ -2197,6 +2207,13 @@ func newActor(ctx context.Context, client *whatsmeow.Client, primaryJID types.JI
 
 	// Find (phone-number) JID and (numeric) LID from list of identifiers given in best-effort search.
 	for _, id := range append([]types.JID{primaryJID}, altJIDs...) {
+		if bot, ok := canBotChatJID(id); ok {
+			// CAN Meta AI v1: assistants use their phone alias, else their bot identity.
+			if bot.Server == types.BotServer {
+				return Actor{JID: bot.String()}
+			}
+			id = bot
+		}
 		if id.Server == types.HiddenUserServer && anonID.IsEmpty() {
 			anonID = id
 		} else if id.Server == types.DefaultUserServer && phoneID.IsEmpty() {
@@ -2245,6 +2262,8 @@ func newChat(ctx context.Context, client *whatsmeow.Client, jid types.JID, isGro
 	var chatJID types.JID
 	if jid.Server == types.DefaultUserServer || jid.Server == types.GroupServer {
 		chatJID = jid
+	} else if bot, ok := canBotChatJID(jid); ok && !isGroup {
+		chatJID = bot
 	} else if jid.Server == types.HiddenUserServer && !isGroup {
 		chatJID, _ = getPNForLIDBounded(ctx, client, jid)
 	}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import asyncio
 import logging
 import time
 from os.path import basename
@@ -28,6 +29,10 @@ GEO_URI_SEARCH_REGEX = (
     r"geo:(?P<lat>-?\d+(\.\d*)?),(?P<lon>-?\d+(\.\d*)?)(;u=(?P<acc>-?\d+(\.\d*)?))?"
 )
 VIEW_ONCE_THREAD = "urn:marco-ml:whatsapp:view-once:0"
+# CAN Muse approvals v2: must match canApprovalCommandMarker in can_hatch_decide.go.
+MUSE_DECISION_COMMAND = "/muse-decidir"
+MUSE_DECISION_MARKER = "\x1eCAN_MUSE_DECISION\x1f"
+MUSE_LEGACY_ID = "1807055946647697@bot"
 
 
 VIDEO_PREVIEW_DOMAINS = (
@@ -163,6 +168,10 @@ class RecipientMixin(abc.ABC):
         Send outgoing plain-text message to given WhatsApp contact.
         """
         assert xmpp_msg.body
+        approval_response = await self.__handle_muse_decision(xmpp_msg.body)
+        if approval_response is not None:
+            self.session.send_gateway_message(approval_response)
+            return self.wa.GenerateMessageID()  # type:ignore[no-untyped-call,no-any-return]
         command_response = await handle_transcription_command(
             self.session.http,
             str(self.session.user_jid.bare),
@@ -280,6 +289,34 @@ class RecipientMixin(abc.ABC):
             Body=replace_mentions(xmpp_msg.body, xmpp_msg.mentions, mention_map),
         )
         self.wa.SendMessage(message)  # type:ignore[no-untyped-call]
+
+    async def __handle_muse_decision(self, body: str) -> str | None:
+        """Answer a pending Muse approval from "/muse-decidir NUMBER ID".
+
+        The client builds this command from the approval message it was sent.
+        Returns the user-facing result, or None when the text is not this command.
+        """
+        parts = body.strip().split(maxsplit=2)
+        if not parts or parts[0].casefold() != MUSE_DECISION_COMMAND:
+            return None
+        if self.legacy_id != MUSE_LEGACY_ID:
+            return "Las aprobaciones sólo se pueden responder en el chat de Muse."
+        if len(parts) != 3 or not parts[1].isdigit():
+            return "No se pudo leer la decisión para Muse."
+        message = whatsapp.Message(  # type:ignore[no-untyped-call]
+            Kind=whatsapp.MessagePlain,
+            ID=self.wa.GenerateMessageID(),  # type:ignore[no-untyped-call]
+            Chat=self.get_wa_chat(),
+            Body=f"{MUSE_DECISION_MARKER}{parts[1]} {parts[2]}",
+        )
+        try:
+            await asyncio.to_thread(self.wa.SendMessage, message)
+        except Exception as exc:  # the Go side explains why it refused
+            return f"No se envió la decisión para Muse: {exc}"
+        return (
+            "Decisión enviada a Muse. "
+            "La solicitud se actualizará cuando Muse la confirme."
+        )
 
     async def __get_preview(self, text: str) -> whatsapp.Preview | None:
         enable_previews = self.session.user.preferences.get(

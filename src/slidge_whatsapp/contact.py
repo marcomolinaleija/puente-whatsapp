@@ -14,6 +14,10 @@ from .mixins import AvatarMixin, RecipientMixin, strip_quote_prefix
 if TYPE_CHECKING:
     from .session import Session
 
+# CAN Meta AI v1: WhatsApp assistants without a phone alias (e.g. Muse).
+_BOT_SERVER = "bot"
+_BOT_USERNAME_PREFIX = "+bot."
+
 
 def _modern_mexico_legacy_id(legacy_id: str) -> str | None:
     local, separator, server = legacy_id.partition("@")
@@ -196,11 +200,20 @@ class Roster(LegacyRoster[Contact]):
     async def legacy_id_to_jid_username(self, legacy_id: str) -> str:
         if "@" not in legacy_id:
             raise XMPPError("item-not-found", "Invalid contact ID, not a JID")
-        return "+" + legacy_id[: legacy_id.find("@")]
+        local, _, server = legacy_id.partition("@")
+        if server == _BOT_SERVER:
+            # CAN Meta AI v1: assistants without a phone alias keep their bot identity.
+            return _BOT_USERNAME_PREFIX + local
+        return "+" + local
 
     async def jid_username_to_legacy_id(self, jid_username: str) -> str:
         if jid_username.startswith("#"):
             raise XMPPError("item-not-found", "Invalid contact ID: group ID given")
+        if jid_username.startswith(_BOT_USERNAME_PREFIX):
+            bot_id = jid_username.removeprefix(_BOT_USERNAME_PREFIX)
+            if not bot_id.isdigit() or len(bot_id) > 24:
+                raise XMPPError("item-not-found", "Invalid assistant ID")
+            return f"{bot_id}@{_BOT_SERVER}"
         if not jid_username.startswith("+"):
             raise XMPPError("item-not-found", "Invalid contact ID, expected '+' prefix")
         legacy_id = jid_username.removeprefix("+") + "@" + whatsapp.DefaultUserServer

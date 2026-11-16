@@ -439,6 +439,11 @@ func (s *Session) SendMessage(message Message) error {
 		return fmt.Errorf("could not parse sender JID for message: %s", err)
 	}
 
+	// CAN Muse approvals v2: a confirmed decision is an RPC, never text.
+	if message.Kind == MessagePlain && strings.HasPrefix(message.Body, canApprovalCommandMarker) {
+		return s.canSendApprovalDecision(s.ctx, s.client, jid.ToNonAD(), message.Body)
+	}
+
 	var payload *waE2E.Message
 	var extra whatsmeow.SendRequestExtra
 
@@ -528,6 +533,10 @@ func (s *Session) SendMessage(message Message) error {
 
 	if message.IsForwarded && (message.Kind == MessagePlain || message.Kind == MessageAttachment) {
 		setForwardedContext(payload)
+	}
+
+	if !message.Chat.IsGroup {
+		jid = s.canPrepareBotSend(s.client, jid, payload) // CAN Meta AI v1
 	}
 
 	s.gateway.logger.Debugf("Sending message to JID '%s': %+v", jid, payload)
@@ -872,6 +881,13 @@ func (s *Session) GetContacts(refresh bool) ([]Contact, error) {
 		current, found := contactsByJID[key]
 		if !found || preferContactCandidate(current, candidate) {
 			contactsByJID[key] = candidate
+		}
+	}
+
+	// CAN Meta AI v1: available assistants join the roster under their phone alias.
+	for _, bot := range s.canBotRosterContacts(client) {
+		if _, found := contactsByJID[bot.Actor.JID]; !found {
+			contactsByJID[bot.Actor.JID] = bot
 		}
 	}
 
@@ -1248,6 +1264,7 @@ func (s *Session) handleEvent(evt any) {
 
 	switch evt := evt.(type) {
 	case *events.AppState:
+		s.canApplyWASAMutation(s.ctx, client, evt.Index, evt.SyncActionValue, "app_state") // CAN WASA v1
 		if action := evt.GetCallLogAction(); action != nil {
 			if record := action.GetCallLogRecord(); record != nil {
 				kind, payload := newCallLogRecordEvent(s.ctx, client, record, "app_state")
@@ -1284,6 +1301,9 @@ func (s *Session) handleEvent(evt any) {
 		if _, connected := evt.(*events.Connected); connected {
 			s.canCallLog("CAN_CALL stage=diagnostics_ready")
 			go s.syncCallLogAppState(client)
+			if _, scanned := canWASAScanned.LoadOrStore(client, true); !scanned {
+				go s.canScanWASA(client) // CAN WASA v1
+			}
 		}
 		if !client.IsLoggedIn() || client.Store.ID == nil {
 			return
@@ -1301,6 +1321,8 @@ func (s *Session) handleEvent(evt any) {
 			}
 		}, false)
 	case *events.Message:
+		// CAN WASA v1: store a root secret before any bot answer that needs it.
+		s.canStoreRootSecretDistribution(s.ctx, client, evt)
 		s.canQueueMessage(s.ctx, client, evt)
 	case *events.Receipt:
 		s.propagateEvent(newReceiptEvent(s.ctx, client, evt))

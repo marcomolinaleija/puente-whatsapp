@@ -246,7 +246,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	if isBotMode {
 		if message.MessageContextInfo.BotMetadata == nil {
 			message.MessageContextInfo.BotMetadata = &waAICommon.BotMetadata{
-				PersonaID: proto.String("867051314767696$760019659443059"),
+				PersonaID: proto.String(canDefaultBotPersona(to)), // CAN WASA v1
 			}
 		}
 
@@ -854,9 +854,18 @@ func (cli *Client) sendDM(
 		return "", nil, err
 	}
 
+	// CAN WASA v1: Muse receives its copy encrypted with the bot root secret.
+	recipientPlaintext := messagePlaintext
+	if to == CANMuseJID {
+		recipientPlaintext, err = cli.canEncryptWASAMessage(ctx, to, id, message)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+
 	node, allDevices, err := cli.prepareMessageNode(
 		ctx, to, id, message, []types.JID{to, ownID.ToNonAD()},
-		messagePlaintext, deviceSentMessagePlaintext, timings, extraParams,
+		recipientPlaintext, deviceSentMessagePlaintext, timings, extraParams,
 	)
 	if err != nil {
 		return "", nil, err

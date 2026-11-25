@@ -7,13 +7,19 @@ import hashlib
 import io
 import json
 import logging
+import re
 import secrets
 import time
 from xml.etree import ElementTree as ET
 
 NAMESPACE = "urn:can:whatsapp:linking:1"
+HINTS = "urn:xmpp:hints"
 LOGIN_TIMEOUT = 190
 TERMINAL = {"canceled", "expired", "connection_error", "logged_out", "needs_pairing"}
+# Phases in which the native client still owns a pairing handshake.
+LIVE = {"connecting", "needs_qr", "paired", "needs_pair_code"}
+# E.164: at most 15 ASCII digits; WhatsMeow itself rejects fewer than 7.
+PHONE = re.compile(r"\+?[0-9]{7,15}")
 ROSTER_RATE_LIMIT_MIN = 300
 ROSTER_RATE_LIMIT_MAX = 1800
 
@@ -73,6 +79,44 @@ class LinkingSession:
         self.sync_retry_after = 0
         self.phone_code = ""
         self.phone_fingerprint = ""
+        self.phone_task = None
+        self.paired_after_cancel = False
+        self.timeout_handle = None
+        self.deadline = 0.0
+        self.notify_pending = False
+
+    def notify(self):
+        """Wake the owner's client; the hint carries no QR, code or credentials."""
+        if self.notify_pending:
+            return
+        xmpp = getattr(self.session, "xmpp", None)
+        user = getattr(self.session, "user_jid", None)
+        if xmpp is None or user is None or not hasattr(xmpp, "make_message"):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.notify_pending = True
+
+        def send():
+            self.notify_pending = False
+            try:
+                # Components must stamp 'from'. Prosody discards bare-JID headlines,
+                # so this is a bodyless "normal" message that XEP-0334 hints keep out
+                # of MAM and offline storage.
+                msg = xmpp.make_message(mto=user.bare, mfrom=xmpp.boundjid.bare,
+                                        mtype="normal")
+                msg.xml.append(ET.Element(f"{{{NAMESPACE}}}state", {
+                    "version": "1", "attempt": self.attempt, "revision": str(self.revision),
+                }))
+                for hint in ("no-store", "no-permanent-store"):
+                    msg.xml.append(ET.Element(f"{{{HINTS}}}{hint}"))
+                msg.send()
+            except Exception:
+                logging.getLogger(__name__).debug("linking hint not sent", exc_info=True)
+
+        loop.call_soon(send)
 
     def change(self, phase, reason=""):
         if phase != "connected" and self.sync_task is not None and not self.sync_task.done():
@@ -85,16 +129,78 @@ class LinkingSession:
             self.qr_deadline = 0.0
             self.ready.clear()
             self.phone_code = self.phone_fingerprint = ""
+        self._arm_timeout()
+        self.notify()
+
+    def _arm_timeout(self):
+        # The deadline is owned by a timer, so a status read never mutates state.
+        if self.timeout_handle is not None:
+            self.timeout_handle.cancel()
+            self.timeout_handle = None
+        if self.authenticated or self.phase not in {"connecting", "paired"}:
+            return
+        self.deadline = self.changed_at + LOGIN_TIMEOUT
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.timeout_handle = loop.call_later(LOGIN_TIMEOUT, self.expire_if_due)
+
+    def expire_if_due(self):
+        self.timeout_handle = None
+        if self.authenticated or self.phase not in {"connecting", "paired"}:
+            return
+        remaining = self.deadline - self.clock()
+        if remaining > 0:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self.timeout_handle = loop.call_later(remaining, self.expire_if_due)
+            return
+        self.change("connection_error", "connection_timeout")
+
+    def fail(self, reason):
+        """Record a failure without hiding a more specific final reason."""
+        if self.phase in TERMINAL and self.reason:
+            return
+        self.change("connection_error", reason)
 
     def reserve(self):
         self.attempt = secrets.token_hex(16)
         self.authenticated = False
         self.mode = "qr"
         self.sync_error = False
+        self.paired_after_cancel = False
         self.sync_retry_after = 0
         self.change("connecting")
 
-    def retry_sync(self, error=None):
+    async def _retire(self):
+        """Disconnect (never Logout) and stop every task of the current attempt."""
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self.session.whatsapp.Disconnect), 10)
+        except Exception as exc:
+            self.change("connection_error", "cancel_failed")
+            raise LinkingError("cancel_failed") from exc
+        current = asyncio.current_task()
+        tasks = [t for t in (self.task, self.bootstrap, self.sync_task, self.phone_task)
+                 if t and t is not current and not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.session.logged = False
+        self.session.is_logging_in = False
+
+    def request_sync(self):
+        """User-triggered retry once automatic retries are exhausted."""
+        if not self.authenticated:
+            raise LinkingError("not_connected")
+        if not self.sync_error:
+            return
+        self.retry_sync(delays=(0,))
+
+    def retry_sync(self, error=None, delays=(30, 60, 120)):
         if error is not None:
             self.sync_retry_after = max(self.sync_retry_after, roster_retry_after(error))
         if (self.sync_task is not None and not self.sync_task.done()
@@ -104,10 +210,10 @@ class LinkingSession:
 
         async def retry():
             failures = 0
-            while failures < 3:
+            while failures < len(delays):
                 # Only a known rate limit has slow ongoing recovery. Other
-                # errors retain the existing three-attempt budget.
-                delay = self.sync_retry_after or (30, 60, 120)[failures]
+                # errors retain the bounded attempt budget.
+                delay = self.sync_retry_after or delays[failures]
                 await asyncio.sleep(delay)
                 if not self.authenticated or attempt != self.attempt:
                     return
@@ -139,6 +245,7 @@ class LinkingSession:
                     self.sync_error = False
                     self.sync_retry_after = 0
                     self.revision += 1
+                    self.notify()
                     return
                 except asyncio.CancelledError:
                     raise
@@ -155,9 +262,6 @@ class LinkingSession:
         self.sync_task = asyncio.create_task(retry())
 
     def snapshot(self):
-        if (not self.authenticated and self.phase in {"connecting", "paired"}
-                and self.clock() - self.changed_at > LOGIN_TIMEOUT):
-            self.change("connection_error", "connection_timeout")
         remaining = max(0.0, self.qr_deadline - self.clock())
         sync = "pending"
         if self.authenticated:
@@ -191,7 +295,7 @@ class LinkingSession:
                 raise
             except Exception:
                 if attempt == self.attempt and not self.authenticated:
-                    self.change("connection_error", self.reason or "login_failed")
+                    self.fail("login_failed")
                     await asyncio.to_thread(self.session.whatsapp.Disconnect)
                 raise
 
@@ -205,15 +309,19 @@ class LinkingSession:
             if request_id in self.requests:
                 if self.requests[request_id] != self.attempt:
                     raise LinkingError("stale_attempt")
-                return
+                if self.authenticated or self.phase in LIVE:
+                    return  # A repeated IQ adopts the attempt it created.
+                # That attempt ended: its token cannot silently reopen it.
+                raise LinkingError("stale_request")
             if self.authenticated:
                 return
-            active = any(t is not None and not t.done() for t in (self.task, self.bootstrap))
-            active = active or bool(self.attempt and self.phase in {
-                "connecting", "needs_qr", "paired", "needs_pair_code",
-            })
-            if self.attempt and self.phase in TERMINAL - {"canceled", "needs_pairing"}:
-                raise LinkingError("cancel_required")
+            live = bool(self.attempt and self.phase in LIVE)
+            if self.attempt and not live and self.phase not in {"canceled", "needs_pairing"}:
+                # A finished attempt is retired here, with the same non-destructive
+                # Disconnect as cancel, so a retry never needs a separate round trip.
+                await self._retire()
+            active = live or any(t is not None and not t.done()
+                                 for t in (self.task, self.bootstrap))
             if not active:
                 self.reserve()
 
@@ -224,7 +332,7 @@ class LinkingSession:
                         raise
                     except Exception:
                         if not self.authenticated:
-                            self.change("connection_error", "login_failed")
+                            self.fail("login_failed")
                     finally:
                         self.session.is_logging_in = False
 
@@ -243,28 +351,24 @@ class LinkingSession:
                 return
             self.change("canceling")
             # Disconnect, never Logout: paired device keys and history survive.
-            try:
-                await asyncio.wait_for(asyncio.to_thread(self.session.whatsapp.Disconnect), 10)
-            except Exception as exc:
-                self.change("connection_error", "cancel_failed")
-                raise LinkingError("cancel_failed") from exc
-            tasks = [t for t in (self.task, self.bootstrap, self.sync_task,
-                                getattr(self, "phone_task", None))
-                     if t and not t.done()]
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            self.session.logged = False
-            self.session.is_logging_in = False
-            self.change("canceled")
+            await self._retire()
+            # A scan that won the race leaves a linked device; say so instead of
+            # pretending nothing happened. The next start logs in with it.
+            self.change("canceled", "paired_after_cancel" if self.paired_after_cancel else "")
             self.ready.set()  # Wake pending phone IQs so they reject this canceled attempt now.
 
     async def phone(self, attempt, phone):
-        if not phone or len(phone) > 20 or not phone.lstrip("+").isdigit():
+        if not isinstance(phone, str) or not PHONE.fullmatch(phone):
             raise LinkingError("invalid_phone")
         if attempt != self.attempt or not attempt:
             raise LinkingError("stale_attempt")
+        if self.authenticated:
+            raise LinkingError("already_connected")
+        if self.phase == "paired":
+            raise LinkingError("already_paired")
+        if self.phase not in LIVE:
+            # Never wait for readiness that a finished attempt cannot produce.
+            raise LinkingError("attempt_ended")
         try:
             await asyncio.wait_for(self.ready.wait(), 15)
         except TimeoutError as exc:
@@ -281,7 +385,7 @@ class LinkingSession:
                 raise LinkingError("cancel_required")
             if self.phone_code:
                 return self.phone_code
-            task = getattr(self, "phone_task", None)
+            task = self.phone_task
             if task is None or task.done():
                 async def request_code():
                     return await asyncio.wait_for(
@@ -291,9 +395,16 @@ class LinkingSession:
                 self.phone_fingerprint = fingerprint
         try:
             code = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            if attempt == self.attempt and self.phase not in {"canceling", "canceled"}:
-                self.change("connection_error", "phone_pair_failed")
+            # A rejected number or transient PairPhone failure keeps the live QR
+            # attempt; only the number binding is released so it can be retried.
+            async with self.lock:
+                if self.phone_task is task:
+                    self.phone_task = None
+                    if not self.phone_code:
+                        self.phone_fingerprint = ""
             raise LinkingError("phone_pair_failed") from exc
         async with self.lock:
             if attempt != self.attempt or self.phase in {"canceling", "canceled"}:
@@ -318,6 +429,7 @@ class LinkingSession:
             self.reserve()
         attempt = self.attempt
         self.qr_deadline = self.clock() + ttl
+        self.qr = b""  # The previous PNG must never be served under the new revision.
         self.ready.set()  # Native websocket is ready, independently of PNG/HTTP.
         self.phase = "needs_pair_code" if self.mode == "code" else "needs_qr"
         self.revision += 1
@@ -333,11 +445,12 @@ class LinkingSession:
         try:
             png = await asyncio.to_thread(render)
         except Exception:
-            self.change("connection_error", "qr_render_failed")
+            self.fail("qr_render_failed")
             return None
         if (attempt == self.attempt and qr_revision == self.qr_revision
                 and self.qr_deadline > self.clock()):
             self.qr = png
+            self.notify()
         return raw
 
 
@@ -366,7 +479,11 @@ def install_session(cls):
 
     async def pair(self, device_id):
         owner = state(self)
-        if owner.phase not in {"canceling", "canceled"}:
+        if owner.phase in {"canceling", "canceled"}:
+            owner.paired_after_cancel = True
+            if owner.phase == "canceled":
+                owner.change("canceled", "paired_after_cancel")
+        else:
             owner.change("paired")
         await original_pair(self, device_id)  # Persist before considering authentication.
 
@@ -377,10 +494,14 @@ def install_session(cls):
         if event.Error or not event.JID:
             owner.authenticated = False
             reason = event.Error.removeprefix("can-link:") or "invalid_connection"
-            owner.change("connecting" if reason == "disconnected" else "connection_error",
-                         reason if reason in {"disconnected", "client_outdated", "stream_replaced",
-                                             "pair_failed", "expired", "unsupported_pairing"}
-                         else "connection_failed")
+            if reason == "disconnected":
+                owner.change("connecting", reason)
+            elif reason == "expired":
+                owner.change("expired", reason)
+            else:
+                owner.change("connection_error", reason if reason in {
+                    "client_outdated", "stream_replaced", "pair_failed", "unsupported_pairing",
+                } else "connection_failed")
             if reason == "disconnected":
                 return  # WhatsMeow owns normal reconnect; do not fail a pending handshake.
             if not event.Error:
@@ -400,7 +521,7 @@ def install_session(cls):
         await original_logout(self)
         current = asyncio.current_task()
         tasks = [task for task in (owner.task, owner.bootstrap, owner.sync_task,
-                                  getattr(owner, "phone_task", None))
+                                  owner.phone_task)
                  if task is not None and task is not current and not task.done()]
         for task in tasks:
             task.cancel()
@@ -441,6 +562,7 @@ def install(gateway):
             if owner.authenticated:
                 owner.sync_error = True
                 owner.revision += 1
+                owner.notify()
                 logging.getLogger(__name__).warning(
                     "WhatsApp authenticated; initial roster sync failed, retrying",
                     exc_info=not roster_retry_after(exc),
@@ -482,6 +604,8 @@ def install(gateway):
                     await owner.cancel(query.get("attempt", ""))
                 elif operation == "phone":
                     code = await owner.phone(query.get("attempt", ""), query.get("phone", ""))
+                elif operation == "sync":
+                    owner.request_sync()
                 elif operation != "status":
                     raise LinkingError("unsupported_operation")
             except LinkingError as exc:
@@ -498,6 +622,11 @@ def install(gateway):
             ET.SubElement(payload, f"{{{NAMESPACE}}}qr", {"mime": "image/png"}).text = (
                 base64.b64encode(owner.qr).decode("ascii")
             )
+        if session is not None and not code and owner.phase == "needs_pair_code" and (
+                owner.phone_code and float(attrs["qr_ttl"]) > 0):
+            # A lost phone reply must not strand the user: status re-delivers the
+            # live code to its owner, exactly like the live QR.
+            code = owner.phone_code
         if code:
             ET.SubElement(payload, f"{{{NAMESPACE}}}code").text = code
         reply.send()

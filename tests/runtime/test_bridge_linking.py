@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import xml.etree.ElementTree as ET
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -20,7 +21,7 @@ class LinkingOwnerTests(unittest.IsolatedAsyncioTestCase):
         )
         return session, LinkingSession(session)
 
-    async def test_start_is_idempotent_and_requires_cancel_for_failed_live_attempt(self):
+    async def test_start_is_idempotent_and_retires_a_finished_attempt(self):
         session, owner = self.session()
         pending = asyncio.Event()
         session.xmpp.login_wrap = AsyncMock(side_effect=lambda _: pending.wait())
@@ -37,13 +38,24 @@ class LinkingOwnerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         session.xmpp.login_wrap.assert_awaited_once()
         owner.change("connection_error", "fixture")
-        with self.assertRaisesRegex(LinkingError, "cancel_required"):
-            await owner.start("new-request")
-        await owner.cancel(attempt)
+        # A finished attempt cannot be reopened by its own token...
+        with self.assertRaisesRegex(LinkingError, "stale_request"):
+            await owner.start("fixture-request")
+        session.whatsapp.Disconnect.assert_not_called()
+        # ...and a new request retires it (Disconnect, never Logout) in one round trip.
+        await owner.start("new-request")
+        session.whatsapp.Disconnect.assert_called_once()
+        self.assertNotEqual(owner.attempt, attempt)
+        self.assertEqual(owner.phase, "connecting")
+        self.assertFalse(hasattr(session.whatsapp, "Logout"))
+        await asyncio.sleep(0)
+        self.assertEqual(session.xmpp.login_wrap.await_count, 2)
+        replacement = owner.attempt
+        await owner.cancel(replacement)
         self.assertEqual(owner.phase, "canceled")
-        session.whatsapp.Disconnect.assert_called_once()
-        await owner.cancel(attempt)
-        session.whatsapp.Disconnect.assert_called_once()
+        self.assertEqual(session.whatsapp.Disconnect.call_count, 2)
+        await owner.cancel(replacement)
+        self.assertEqual(session.whatsapp.Disconnect.call_count, 2)
 
     async def test_failed_cancel_retains_attempt_and_never_logs_out(self):
         session, owner = self.session()
@@ -131,6 +143,8 @@ class LinkingOwnerTests(unittest.IsolatedAsyncioTestCase):
         _, owner = self.session()
         owner.reserve()
         owner.clock = lambda: owner.changed_at + 191
+        self.assertEqual(owner.snapshot()["phase"], "connecting")  # A read never mutates.
+        owner.expire_if_due()
         self.assertEqual(owner.snapshot()["phase"], "connection_error")
         self.assertEqual(owner.reason, "connection_timeout")
 
@@ -493,6 +507,126 @@ class GroupListRecoveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "fictional error"):
             await Bookmarks.fill(groups)
         self.assertFalse(hasattr(groups, "_can_group_retry_at"))
+
+
+class LinkingHardeningTests(unittest.IsolatedAsyncioTestCase):
+    """Behaviour added with the client contract: hints, phone errors, cancel races."""
+
+    def session(self):
+        sent = []
+        xmpp = SimpleNamespace(
+            login_wrap=AsyncMock(), boundjid=SimpleNamespace(bare="whatsapp.example.invalid"),
+        )
+
+        def make_message(**kwargs):
+            message = SimpleNamespace(xml=ET.Element("message"), kwargs=kwargs)
+            message.send = lambda: sent.append(message)
+            return message
+
+        xmpp.make_message = make_message
+        session = SimpleNamespace(
+            whatsapp=SimpleNamespace(Disconnect=Mock(), PairPhone=Mock(return_value="ABCD-1234")),
+            xmpp=xmpp, logged=False, is_logging_in=False,
+            user_jid=SimpleNamespace(bare="owner@example.invalid"),
+        )
+        return session, LinkingSession(session), sent
+
+    async def test_changes_send_one_debounced_bodyless_hint_without_secrets(self):
+        _, owner, sent = self.session()
+        owner.reserve()
+        owner.change("needs_qr")
+        owner.qr = PNG
+        await asyncio.sleep(0)
+        self.assertEqual(len(sent), 1)
+        message = sent[0]
+        self.assertEqual(message.kwargs["mto"], "owner@example.invalid")
+        self.assertEqual(message.kwargs["mtype"], "normal")
+        tags = [child.tag for child in message.xml]
+        self.assertIn("{urn:can:whatsapp:linking:1}state", tags)
+        self.assertIn("{urn:xmpp:hints}no-store", tags)
+        self.assertIn("{urn:xmpp:hints}no-permanent-store", tags)
+        self.assertIsNone(message.xml.find("body"))
+        state_el = message.xml.find("{urn:can:whatsapp:linking:1}state")
+        self.assertEqual(state_el.get("attempt"), owner.attempt)
+        self.assertEqual(set(state_el.attrib), {"version", "attempt", "revision"})
+
+    async def test_invalid_phone_is_rejected_before_touching_the_attempt(self):
+        session, owner, _ = self.session()
+        owner.reserve()
+        for bad in ("", "12345", "+52 55 0000 0000", "+1234567890123456", "abc1234567"):
+            with self.assertRaisesRegex(LinkingError, "invalid_phone"):
+                await owner.phone(owner.attempt, bad)
+        session.whatsapp.PairPhone.assert_not_called()
+        self.assertEqual(owner.phase, "connecting")
+
+    async def test_phone_on_ended_or_paired_attempt_fails_immediately(self):
+        _, owner, _ = self.session()
+        owner.reserve()
+        owner.change("paired")
+        with self.assertRaisesRegex(LinkingError, "already_paired"):
+            await asyncio.wait_for(owner.phone(owner.attempt, "+12025550100"), 1)
+        owner.change("connection_error", "fixture")
+        with self.assertRaisesRegex(LinkingError, "attempt_ended"):
+            await asyncio.wait_for(owner.phone(owner.attempt, "+12025550100"), 1)
+
+    async def test_rejected_number_keeps_live_attempt_and_allows_another_number(self):
+        session, owner, _ = self.session()
+        owner.reserve()
+        owner.change("needs_qr")
+        owner.ready.set()
+        owner.qr_deadline = owner.clock() + 60
+        attempt = owner.attempt
+        session.whatsapp.PairPhone.side_effect = RuntimeError("fixture rejection")
+        with self.assertRaisesRegex(LinkingError, "phone_pair_failed"):
+            await owner.phone(attempt, "+12025550100")
+        self.assertEqual((owner.attempt, owner.phase), (attempt, "needs_qr"))
+        session.whatsapp.PairPhone.side_effect = None
+        self.assertEqual(await owner.phone(attempt, "+12025550101"), "ABCD-1234")
+        self.assertEqual(owner.phase, "needs_pair_code")
+
+    async def test_pair_during_cancel_is_reported_and_new_qr_is_not_implied(self):
+        calls = []
+
+        class Session:
+            async def login(self):
+                return "connected"
+
+            async def on_wa_qr(self, value):
+                pass
+
+            async def on_wa_pair(self, value):
+                calls.append("persist-device")
+
+            async def on_wa_connect(self, value):
+                pass
+
+            async def logout(self):
+                pass
+
+            async def on_wa_logged_out(self, value):
+                pass
+
+        install_session(Session)
+        session = Session()
+        owner = state(session)
+        owner.reserve()
+        owner.change("canceled")
+        await session.on_wa_pair("fictional-device")
+        self.assertEqual((owner.phase, owner.reason), ("canceled", "paired_after_cancel"))
+        self.assertEqual(calls, ["persist-device"])
+
+    async def test_manual_sync_requires_connection_and_only_retries_on_error(self):
+        _, owner, _ = self.session()
+        with self.assertRaisesRegex(LinkingError, "not_connected"):
+            owner.request_sync()
+        owner.authenticated = True
+        owner.change("connected")
+        owner.request_sync()
+        self.assertIsNone(owner.sync_task)
+        owner.sync_error = True
+        with patch.object(owner, "retry_sync") as retry:
+            owner.request_sync()
+        retry.assert_called_once_with(delays=(0,))
 
 
 if __name__ == "__main__":

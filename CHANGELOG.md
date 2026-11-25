@@ -1,5 +1,27 @@
 # Publicaciones del puente
 
+## Sin publicar — vinculación robusta (desplegada como candidata el 25 de noviembre de 2026)
+
+Imagen local `cliente-xmpp-bridge:linking-20261125` en `marco-vps`, construida con el
+target `release` sobre el código sin commit de esta rama (base v39). No está en GHCR.
+
+- Un `start` con un token cuyo intento terminó responde `stale_request`; uno nuevo retira
+  el intento anterior (sólo `Disconnect`, nunca `Logout`) sin exigir `cancel`.
+- `phone` valida el número (E.164), responde de inmediato `already_paired` o
+  `attempt_ended` y, si WhatsApp rechaza el número, conserva el intento con su QR.
+- Avisos de estado sin cuerpo (`type="normal"`, XEP-0334 `no-store`) despiertan al cliente;
+  no llevan QR, código ni credenciales y no entran en MAM.
+- El vencimiento lo dispara un temporizador; `snapshot()` ya no muta el estado.
+- Un escaneo que gana a la cancelación se informa como `paired_after_cancel`; la
+  expiración nativa se reporta como `expired`; `op="sync"` reintenta la sincronización.
+- Conserva la recuperación de v38 ante `429: rate-overlimit`.
+
+El target `release` aprobó Go, Go/race, las 23 comprobaciones del runtime (con las nuevas
+pruebas de vinculación) y el probe de entrada. Un e2e de 27 pasos con Prosody real y
+WhatsMeow simulado, y una sonda en producción de 14 pasos con cuenta ficticia (QR real de
+WhatsApp, cancelado sin escanear) pasaron. Rollback: restaurar `compose.yml` del respaldo
+`/opt/xmpp/backups/linking-20261125T231929Z/` (v39 por digest) y recrear sólo el puente.
+
 ## v39 — 16 de noviembre de 2026
 
 Imagen `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v39`, plataforma `linux/amd64`.

@@ -994,9 +994,13 @@ class Session(BaseSession[Contact]):
         )
         if not data.Actor.JID:
             return None
+        if data.Actor.JID == self.contacts.user_legacy_id:
+            # WhatsApp confirms the account's own number, but it is never a contact.
+            raise XMPPError("not-acceptable", "own-number")
 
         contact = await self.contacts.add_whatsapp_contact(data)
-        assert contact is not None
+        if contact is None:
+            raise XMPPError("item-not-found", "No contact was found with the info you provided.")
         await contact.add_to_roster()
 
         return SearchResult(

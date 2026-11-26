@@ -35,6 +35,10 @@ async def main(root: Path) -> None:
     ns = tiq.NAMESPACE
     http = UnusedHTTP()
 
+    # Reading state never creates the private credentials file.
+    assert dg.account_api_key(ACCOUNT) == ""
+    assert not (root / "state" / "deepgram-credentials.sqlite3").exists()
+
     # Without any key nothing is available and commands cannot switch it on.
     assert not dg.transcription_available(ACCOUNT)
     assert not dg.transcription_enabled(ACCOUNT, CHAT)

@@ -203,7 +203,8 @@ def normalize_api_key(api_key: str) -> str:
 
 def account_api_key(account: str) -> str:
     account = _account_key(account)
-    if not account:
+    # Reading never creates the private file: no file means "no own key".
+    if not account or not _credentials_path().is_file():
         return ""
     with _connect_credentials() as database:
         row = database.execute(

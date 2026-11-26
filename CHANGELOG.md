@@ -1,5 +1,19 @@
 # Publicaciones del puente
 
+## v42 — candidata del 26 de noviembre de 2026 (sin publicar)
+
+Construida en `marco-vps` desde b8efeeb con el target `release`; no está en GHCR ni
+desplegada. Aprobó Go, Go/race, las 24 comprobaciones del runtime y el probe de entrada.
+
+- Deepgram por cuenta: clave propia en un archivo `600` (nunca devuelta ni registrada),
+  servicio, transcripción automática, entrega privada o como respuesta en el chat y
+  excepciones por chat. El IQ `urn:can:whatsapp:transcription:0` y los comandos
+  `/transcribe` comparten el mismo estado.
+- Nuevos `/transcribe reply|private`, `/transcribe service on|off` y `/transcribe status`.
+- Transcripción bajo demanda de audios del directorio de adjuntos, sin descargar URLs.
+- Las transcripciones privadas citan su nota de voz.
+- La búsqueda de números (XEP-0055/0100) ya no bloquea el bucle del puente.
+
 ## v40 — 25 de noviembre de 2026
 
 Imagen `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v40`, plataforma `linux/amd64`.

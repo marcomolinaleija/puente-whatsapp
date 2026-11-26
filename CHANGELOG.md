@@ -1,9 +1,10 @@
 # Publicaciones del puente
 
-## Sin publicar — vinculación robusta (desplegada como candidata el 25 de noviembre de 2026)
+## v40 — 25 de noviembre de 2026
 
-Imagen local `cliente-xmpp-bridge:linking-20261125` en `marco-vps`, construida con el
-target `release` sobre el código sin commit de esta rama (base v39). No está en GHCR.
+Imagen `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v40`, plataforma `linux/amd64`.
+Digest: `sha256:baaec66aeecadea05fc732a915d6039d1df54febdb37440c7f7e7334c31176c9`.
+Código construido: [142fe3b](https://github.com/marcomolinaleija/puente-whatsapp/commit/142fe3bd0c962bba3ca7de98c535aad5be8a8173).
 
 - Un `start` con un token cuyo intento terminó responde `stale_request`; uno nuevo retira
   el intento anterior (sólo `Disconnect`, nunca `Logout`) sin exigir `cancel`.
@@ -14,13 +15,15 @@ target `release` sobre el código sin commit de esta rama (base v39). No está e
 - El vencimiento lo dispara un temporizador; `snapshot()` ya no muta el estado.
 - Un escaneo que gana a la cancelación se informa como `paired_after_cancel`; la
   expiración nativa se reporta como `expired`; `op="sync"` reintenta la sincronización.
-- Conserva la recuperación de v38 ante `429: rate-overlimit`.
+- Conserva la recuperación de v38 ante `429: rate-overlimit` y todo lo de v39.
 
-El target `release` aprobó Go, Go/race, las 23 comprobaciones del runtime (con las nuevas
-pruebas de vinculación) y el probe de entrada. Un e2e de 27 pasos con Prosody real y
-WhatsMeow simulado, y una sonda en producción de 14 pasos con cuenta ficticia (QR real de
-WhatsApp, cancelado sin escanear) pasaron. Rollback: restaurar `compose.yml` del respaldo
-`/opt/xmpp/backups/linking-20261125T231929Z/` (v39 por digest) y recrear sólo el puente.
+El target `release` aprobó Go, Go/race, las 23 comprobaciones del runtime (con las
+nuevas pruebas de vinculación) y el probe de entrada. Un e2e de 27 pasos con Prosody
+real y WhatsMeow simulado pasó. La publicación comprobó que no existía `v40` y que la
+última etiqueta era `v39`, y verificó el manifiesto anónimo por digest. Desplegada por
+digest: `healthy`, cuentas existentes autenticadas y una sonda de 14 pasos con cuenta
+ficticia (QR real de WhatsApp, cancelado sin escanear) aprobada. La vinculación real
+con un teléfono y NVDA quedan para prueba humana.
 
 ## v39 — 16 de noviembre de 2026
 

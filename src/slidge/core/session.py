@@ -507,7 +507,13 @@ class BaseSession(
             return await muc.get_participant(nick, create=False, fill_first=True)
         return muc
 
-    async def wait_for_ready(self, timeout: int | float | None = 10) -> None:
+    def can_stanza_requires_groups(self, stanza: object) -> bool:
+        """CAN readiness split v1: plugins may exempt stanzas that never touch groups."""
+        return True
+
+    async def wait_for_ready(
+        self, timeout: int | float | None = 10, groups: bool = True
+    ) -> None:
         # """
         # Wait until session, contacts and bookmarks are ready
         #
@@ -519,7 +525,8 @@ class BaseSession(
         try:
             await asyncio.wait_for(asyncio.shield(self.ready), timeout)
             await asyncio.wait_for(asyncio.shield(self.contacts.ready), timeout)
-            await asyncio.wait_for(asyncio.shield(self.bookmarks.ready), timeout)
+            if groups:
+                await asyncio.wait_for(asyncio.shield(self.bookmarks.ready), timeout)
         except TimeoutError:
             raise XMPPError(
                 "recipient-unavailable",

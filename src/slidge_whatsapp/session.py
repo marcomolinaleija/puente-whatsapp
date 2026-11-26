@@ -38,6 +38,7 @@ from .generated import go, whatsapp
 from .sticker_pack import normalize_pack
 from .group import MUC, Bookmarks, Participant
 import time
+from .readiness import event_requires_groups, stanza_requires_groups
 from .deepgram_transcription import (
     build_audio_dedup_key,
     claim_audio,
@@ -166,6 +167,10 @@ class Session(BaseSession[Contact]):
         self.__reset_connected()
         self.__roster_sync_task: asyncio.Task[None] | None = None
 
+    def can_stanza_requires_groups(self, stanza: object) -> bool:
+        # CAN readiness split v1: 1:1 sends need contacts, not the group list.
+        return stanza_requires_groups(stanza)
+
     async def login(self) -> str:
         """
         Initiate login process and connect session to WhatsApp. Depending on existing state, login
@@ -193,15 +198,19 @@ class Session(BaseSession[Contact]):
         """
         if event_kind == whatsapp.EventUnknown:
             return
+        event = whatsapp.EventPayload(handle=ptr)  # type:ignore[no-untyped-call]
         if event_kind not in (
             whatsapp.EventQRCode,
             whatsapp.EventPairDeviceID,
             whatsapp.EventConnect,
             whatsapp.EventLoggedOut,
         ):
-            await self.contacts.ready
-            await self.bookmarks.ready
-        event = whatsapp.EventPayload(handle=ptr)  # type:ignore[no-untyped-call]
+            # CAN readiness split v1: a pending or rate-limited group list must
+            # not hold individual chats. Shield: a cancelled callback never
+            # cancels the shared futures.
+            await asyncio.shield(self.contacts.ready)
+            if event_requires_groups(event_kind, event, whatsapp):
+                await asyncio.shield(self.bookmarks.ready)
         match event_kind:
             case whatsapp.EventQRCode:
                 await self.on_wa_qr(event.QRCode)
@@ -1038,3 +1047,7 @@ def _bytes_conversion(slice_byte: go.Slice_byte) -> bytes | None:
 # CAN inbound isolation v1
 from .inbound import install as _install_inbound
 _install_inbound(Session, whatsapp)
+
+# CAN history v1: history marker and the phone's unread summary.
+from .history_state import install as _install_history
+_install_history(Session)

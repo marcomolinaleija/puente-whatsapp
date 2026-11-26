@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -40,6 +41,27 @@ def roster_retry_after(error, previous=0):
     if "status 429: rate-overlimit" in text:
         return min(max(previous * 2, ROSTER_RATE_LIMIT_MIN), ROSTER_RATE_LIMIT_MAX)
     return 0
+
+
+def account_identity(session, wa_jid):
+    """Stable per-account tag that does not reveal the number.
+
+    Keyed with the component secret and the XMPP account, so the client can
+    only compare it for equality; a bare hash of a phone number is reversible.
+    """
+    if not wa_jid:
+        return ""
+    import hmac
+
+    try:
+        from slidge import global_config
+        secret = str(getattr(global_config, "SECRET", "") or "")
+    except Exception:
+        secret = ""
+    user = str(getattr(getattr(session, "user_jid", None), "bare", "") or "")
+    key = f"can-identity:1:{secret}:{user}".encode()
+    number = str(wa_jid).split("@", 1)[0].split(":", 1)[0].split(".", 1)[0]
+    return hmac.new(key, number.encode(), hashlib.sha256).hexdigest()[:24]
 
 
 def readiness_succeeded(future):
@@ -77,6 +99,14 @@ class LinkingSession:
         self.sync_error = False
         self.sync_task = None
         self.sync_retry_after = 0
+        # Absolute deadline of a known rate limit: a cancelled retry resumes
+        # with what remains, never with the whole cooldown again.
+        self.sync_retry_at = 0.0
+        self.sync_next_at = 0.0
+        self.sync_reason = ""
+        # Opaque, non-reversible tag of the linked WhatsApp account (no number).
+        self.identity = ""
+        self.connected_attempt = None
         self.phone_code = ""
         self.phone_fingerprint = ""
         self.phone_task = None
@@ -173,6 +203,8 @@ class LinkingSession:
         self.sync_error = False
         self.paired_after_cancel = False
         self.sync_retry_after = 0
+        self.sync_retry_at = self.sync_next_at = 0.0
+        self.sync_reason = ""
         self.change("connecting")
 
     async def _retire(self):
@@ -199,10 +231,25 @@ class LinkingSession:
         if not self.sync_error:
             return
         self.retry_sync(delays=(0,))
+        # The owner always learns that its request was taken, and when the next
+        # attempt runs (a rate-limited group list keeps its remaining cooldown).
+        self.revision += 1
+        self.notify()
+
+    def _set_rate_limit(self, retry_after):
+        self.sync_retry_after = retry_after
+        self.sync_retry_at = self.clock() + retry_after if retry_after else 0.0
+
+    def _rate_limit_remaining(self):
+        if not self.sync_retry_after:
+            return 0
+        return max(0, math.ceil(self.sync_retry_at - self.clock()))
 
     def retry_sync(self, error=None, delays=(30, 60, 120)):
         if error is not None:
-            self.sync_retry_after = max(self.sync_retry_after, roster_retry_after(error))
+            retry_after = roster_retry_after(error)
+            if retry_after > self._rate_limit_remaining():
+                self._set_rate_limit(retry_after)
         if (self.sync_task is not None and not self.sync_task.done()
                 and not self.sync_task.cancelling()):
             return
@@ -213,8 +260,13 @@ class LinkingSession:
             while failures < len(delays):
                 # Only a known rate limit has slow ongoing recovery. Other
                 # errors retain the bounded attempt budget.
-                delay = self.sync_retry_after or delays[failures]
-                await asyncio.sleep(delay)
+                delay = (self._rate_limit_remaining() if self.sync_retry_after
+                         else delays[failures])
+                self.sync_next_at = self.clock() + delay
+                try:
+                    await asyncio.sleep(delay)
+                finally:
+                    self.sync_next_at = 0.0
                 if not self.authenticated or attempt != self.attempt:
                     return
                 try:
@@ -243,43 +295,67 @@ class LinkingSession:
                         raise RuntimeError("Roster readiness was cancelled or failed")
                     self.session.send_gateway_status("Logged in", show="chat")
                     self.sync_error = False
-                    self.sync_retry_after = 0
+                    self._set_rate_limit(0)
+                    self.sync_reason = ""
                     self.revision += 1
                     self.notify()
                     return
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    self.sync_retry_after = roster_retry_after(exc, self.sync_retry_after)
+                    self._set_rate_limit(roster_retry_after(exc, self.sync_retry_after))
                     if not self.sync_retry_after:
                         failures += 1
+                    self.sync_reason = "rate_limited" if self.sync_retry_after else "failed"
                     logging.getLogger(__name__).warning(
                         "WhatsApp roster sync retry failed; cooldown=%ss",
                         self.sync_retry_after, exc_info=not self.sync_retry_after,
                     )
+                    # Each failed attempt is visible to the owner, never silent.
+                    self.revision += 1
+                    self.notify()
             # Exhaustion remains visible as sync=error; never acknowledge completion.
 
         self.sync_task = asyncio.create_task(retry())
 
+    def _readiness_complete(self):
+        contacts = getattr(getattr(self.session, "contacts", None), "ready", None)
+        if not readiness_succeeded(contacts):
+            return False
+        xmpp = getattr(self.session, "xmpp", None)
+        if xmpp is not None and getattr(xmpp, "GROUPS", True) is False:
+            return True  # A gateway without groups never fills bookmarks.
+        groups = getattr(getattr(self.session, "bookmarks", None), "ready", None)
+        return readiness_succeeded(groups)
+
     def snapshot(self):
         remaining = max(0.0, self.qr_deadline - self.clock())
         sync = "pending"
+        retry_in = 0.0
         if self.authenticated:
-            contacts = getattr(getattr(self.session, "contacts", None), "ready", None)
-            groups = getattr(getattr(self.session, "bookmarks", None), "ready", None)
             if self.sync_error:
                 sync = "error"
-            elif readiness_succeeded(contacts) and readiness_succeeded(groups):
+            elif self._readiness_complete():
                 sync = "ready"
             else:
                 sync = "syncing"
-        return {
+            running = self.sync_task is not None and not self.sync_task.done()
+            if sync == "error" and running and self.sync_next_at:
+                retry_in = max(0.0, self.sync_next_at - self.clock())
+        result = {
             "version": "1", "attempt": self.attempt, "revision": str(self.revision),
             "phase": self.phase, "reason": self.reason,
             "authenticated": "1" if self.authenticated else "0",
             "qr_revision": str(self.qr_revision), "qr_ttl": f"{remaining:.3f}",
             "sync": sync,
         }
+        # Optional attributes: older clients ignore them.
+        if sync == "error":
+            result["sync_reason"] = self.sync_reason or "failed"
+            result["sync_retry_in"] = f"{retry_in:.0f}"
+        if self.authenticated and self.identity:
+            result["identity"] = self.identity
+        return result
 
     async def login(self, original):
         if self.task is not None and not self.task.done():
@@ -509,9 +585,18 @@ def install_session(cls):
                 event = SimpleNamespace(Error="invalid_connection", JID="")
         else:
             owner.authenticated = True
+            owner.connected_attempt = owner.attempt
+            owner.identity = account_identity(self, event.JID)
             owner.change("connected")
         await original_connect(self, event)
-        if owner.authenticated and owner.sync_error:
+        if owner.authenticated and (owner.sync_error or (
+                hasattr(self, "contacts")
+                and not getattr(self, "is_logging_in", False)
+                and not owner._readiness_complete())):
+            # A transport drop during the first sync must not strand readiness
+            # in "syncing" (no error, so no manual retry). While login_wrap is
+            # still filling, that fill owns the work instead.
+            owner.sync_error = True
             owner.retry_sync()
 
     async def logout(self):
@@ -552,13 +637,34 @@ def install(gateway):
     async def monitored_login(session):
         try:
             result = await original_login_wrap(session)
-            if not state(session).authenticated:
+            owner = state(session)
+            if not owner.authenticated:
                 session.logged = False
             else:
-                state(session).sync_error = False
+                owner.sync_error = False
+                owner.sync_reason = ""
+                # The owner learns "ready" from a hint, not from the next poll.
+                owner.revision += 1
+                owner.notify()
             return result
         except Exception as exc:
             owner = state(session)
+            if not owner.authenticated and owner.connected_attempt == owner.attempt:
+                # Authenticated in this attempt, then a transport drop interrupted
+                # the first sync. The link is valid: remember the pending sync so
+                # the reconnect retries it, instead of reporting a failed login.
+                owner.sync_error = True
+                owner.sync_reason = "failed"
+                owner.revision += 1
+                owner.notify()
+                logging.getLogger(__name__).warning(
+                    "WhatsApp disconnected during the initial roster sync; retrying on reconnect",
+                    exc_info=not roster_retry_after(exc),
+                )
+                retry_after = roster_retry_after(exc)
+                if retry_after > owner._rate_limit_remaining():
+                    owner._set_rate_limit(retry_after)
+                return "WhatsApp conectado; sincronización pendiente."
             if owner.authenticated:
                 owner.sync_error = True
                 owner.revision += 1

@@ -48,7 +48,7 @@ class DispatcherMixin:
             log.debug("Ignoring message to component")
             raise Ignore
         session = await self._get_session_from_jid(
-            stanza.get_from(), timeout, wait_for_ready, logged
+            stanza.get_from(), timeout, wait_for_ready, logged, stanza=stanza
         )
         if isinstance(stanza, Message) and _ignore(session, stanza):
             raise Ignore
@@ -60,6 +60,7 @@ class DispatcherMixin:
         timeout: int | None = 10,
         wait_for_ready: bool = True,
         logged: bool = False,
+        stanza: object = None,
     ) -> AnySession:
         session = self.xmpp.get_session_from_jid(jid)
         if session is None:
@@ -67,7 +68,13 @@ class DispatcherMixin:
         if logged:
             session.raise_if_not_logged()
         if wait_for_ready:
-            await session.wait_for_ready(timeout)
+            # CAN readiness split v1: without a stanza or the plugin hook, keep
+            # the original full wait (and the original call signature).
+            hook = getattr(session, "can_stanza_requires_groups", None)
+            if stanza is None or not callable(hook) or hook(stanza):
+                await session.wait_for_ready(timeout)
+            else:
+                await session.wait_for_ready(timeout, groups=False)
         return session
 
     async def get_muc_from_stanza(self, iq: Iq | Message | Presence) -> AnyMUC:

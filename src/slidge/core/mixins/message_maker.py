@@ -13,6 +13,7 @@ from slixmpp import Message
 from slixmpp.plugins.xep_0511.stanza import LinkMetadata
 from slixmpp.types import MessageTypes
 
+from slidge import can_history
 from slidge.util import strip_illegal_chars
 
 from ...db.models import GatewayUser
@@ -87,6 +88,9 @@ class MessageMaker(BaseSender):
             msg.enable(hint)
         self._set_msg_id(msg, legacy_msg_id)
         self._add_delay(msg, when)
+        # CAN history marker v1: history must never look new to the client.
+        if can_history.active():
+            can_history.mark(msg)
         if link_previews:
             self._add_link_previews(msg, link_previews)
         if reply_to:

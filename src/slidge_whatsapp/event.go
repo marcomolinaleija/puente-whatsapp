@@ -2278,6 +2278,65 @@ func newChat(ctx context.Context, client *whatsmeow.Client, jid types.JID, isGro
 	}
 }
 
+// CAN history unread summary v1. WhatsApp's history sync carries the phone's
+// unread state per conversation. It travels to Python as a receipt-shaped
+// payload with a private kind, so the gopy bindings stay unchanged. It is a
+// summary, never a read marker: it does not acknowledge any message.
+const ReceiptCANUnreadSummary ReceiptKind = 100
+
+const canUnreadSummaryPrefix = "can-unread:1:"
+
+// canHistoryUnreadSummary returns the phone's unread state for one history
+// conversation. Status broadcasts, newsletters and unresolvable chats are
+// skipped: the client must never get a summary for a chat it cannot open.
+func canHistoryUnreadSummary(
+	ctx context.Context,
+	client *whatsmeow.Client,
+	conversation *waHistorySync.Conversation,
+) (EventKind, *EventPayload) {
+	if conversation == nil || conversation.GetID() == "" {
+		return EventUnknown, nil
+	}
+	jid, err := types.ParseJID(conversation.GetID())
+	if err != nil || jid.User == "" {
+		return EventUnknown, nil
+	}
+	switch jid.Server {
+	case types.DefaultUserServer, types.HiddenUserServer, types.GroupServer:
+	default:
+		return EventUnknown, nil
+	}
+	chat := newChat(ctx, client, jid, jid.Server == types.GroupServer)
+	if chat.JID == "" {
+		return EventUnknown, nil
+	}
+	marked := 0
+	if conversation.GetMarkedAsUnread() {
+		marked = 1
+	}
+	actor := Actor{IsMe: true}
+	if client != nil && client.Store != nil && client.Store.ID != nil {
+		actor = newActor(ctx, client, client.Store.GetJID(), client.Store.GetLID())
+		actor.IsMe = true
+	}
+	return EventReceipt, &EventPayload{Receipt: Receipt{
+		Kind: ReceiptCANUnreadSummary,
+		MessageIDs: []string{fmt.Sprintf(
+			"%s%d:%d", canUnreadSummaryPrefix, conversation.GetUnreadCount(), marked,
+		)},
+		Actor:     actor,
+		Chat:      chat,
+		Timestamp: int64(conversation.GetConversationTimestamp()),
+	}}
+}
+
+// canHistoryCarriesUnreadState: only bootstrap and recent syncs describe the
+// phone's current state; on-demand pages are older history.
+func canHistoryCarriesUnreadState(kind waHistorySync.HistorySync_HistorySyncType) bool {
+	return kind == waHistorySync.HistorySync_INITIAL_BOOTSTRAP ||
+		kind == waHistorySync.HistorySync_RECENT
+}
+
 // canHistoryReceipt extracts only explicit per-person receipt evidence.
 func canHistoryReceipt(delivered, read int64) (ReceiptKind, int64, bool) {
 	if read > 0 {

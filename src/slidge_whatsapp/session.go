@@ -1521,6 +1521,10 @@ func (s *Session) canHandleHistory(ctx context.Context, client *whatsmeow.Client
 				}
 				emit(newEventFromHistory(ctx, client, msg.GetMessage()))
 			}
+			// After its messages, so the chat exists when the summary arrives.
+			if canHistoryCarriesUnreadState(evt.Data.GetSyncType()) {
+				emit(canHistoryUnreadSummary(ctx, client, c))
+			}
 		}
 	}
 

@@ -30,9 +30,8 @@ def install(session_class, whatsapp):
         task = asyncio.current_task()
         tasks.add(task)
         try:
-            # Do not let cancellation of an old callback cancel the shared gates.
-            await asyncio.shield(session.contacts.ready)
-            await asyncio.shield(session.bookmarks.ready)
+            # The shielded contact/group gates live in handle_event, which knows
+            # whether this event touches a group (CAN readiness split v1).
             return await original_event(session, kind, ptr)
         finally:
             tasks.discard(task)

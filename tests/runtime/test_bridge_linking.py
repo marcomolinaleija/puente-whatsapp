@@ -629,5 +629,251 @@ class LinkingHardeningTests(unittest.IsolatedAsyncioTestCase):
         retry.assert_called_once_with(delays=(0,))
 
 
+class PostLinkSyncTests(unittest.IsolatedAsyncioTestCase):
+    """Post-link sync audit: E2, E3, E8, P1, P4, M4 and the history contract (E1/M1)."""
+
+    def owner(self, clock=None):
+        loop = asyncio.get_running_loop()
+        session = SimpleNamespace(
+            contacts=SimpleNamespace(ready=loop.create_future(), _fill=AsyncMock()),
+            bookmarks=SimpleNamespace(ready=loop.create_future(), fill=AsyncMock()),
+            xmpp=SimpleNamespace(GROUPS=True), user_jid=SimpleNamespace(bare="owner@example.invalid"),
+            send_gateway_status=Mock(), is_logging_in=False,
+        )
+        owner = LinkingSession(session, clock=clock) if clock else LinkingSession(session)
+        session._can_linking = owner
+        return session, owner
+
+    async def test_manual_retry_and_each_failure_are_announced_with_remaining_cooldown(self):
+        now = [1000.0]
+        session, owner = self.owner(clock=lambda: now[0])
+        owner.attempt = "fictional-attempt"
+        owner.authenticated = True
+        owner.change("connected")
+        session.contacts.ready.set_result(True)
+        owner.sync_error = True
+        owner._set_rate_limit(900)
+        gate, entered, sleeps = asyncio.Event(), asyncio.Event(), []
+
+        async def sleep(delay):
+            # The patch replaces asyncio.sleep globally: never call it from the test.
+            sleeps.append(delay)
+            entered.set()
+            await gate.wait()
+
+        revision = owner.revision
+        with patch("slidge_whatsapp.linking.asyncio.sleep", side_effect=sleep):
+            now[0] += 600  # The cooldown already ran for 10 of its 15 minutes.
+            owner.request_sync()
+            await entered.wait()
+            self.assertGreater(owner.revision, revision)  # The request is never silent.
+            self.assertEqual(sleeps, [300])  # Only what remains, never the whole 900 s.
+            snap = owner.snapshot()
+            self.assertEqual(snap["sync"], "error")
+            self.assertEqual(snap["sync_retry_in"], "300")
+            revision = owner.revision
+            session.bookmarks.fill.side_effect = RuntimeError("fixture groups timeout")
+            gate.set()
+            await owner.sync_task
+        self.assertGreater(owner.revision, revision)  # The failed attempt is visible.
+        self.assertEqual(owner.snapshot()["sync_reason"], "failed")
+
+    async def test_disconnect_during_first_sync_is_retried_on_reconnect(self):
+        calls = []
+
+        class Session:
+            async def login(self):
+                return "connected"
+
+            async def on_wa_qr(self, value): ...
+            async def on_wa_pair(self, value): ...
+            async def on_wa_connect(self, value):
+                calls.append("connect")
+            async def logout(self): ...
+            async def on_wa_logged_out(self, value): ...
+
+        install_session(Session)
+        loop = asyncio.get_running_loop()
+        session = Session()
+        session.contacts = SimpleNamespace(ready=loop.create_future())
+        session.contacts.ready.set_result(True)
+        session.bookmarks = SimpleNamespace(ready=loop.create_future())
+        session.xmpp = SimpleNamespace(GROUPS=True)
+        session.is_logging_in = True
+        owner = state(session)
+        owner.reserve()
+        with patch.object(owner, "retry_sync") as retry:
+            await session.on_wa_connect(SimpleNamespace(Error="", JID="15550001111@s.whatsapp.net"))
+            retry.assert_not_called()  # The running login_wrap owns the first fill.
+            await session.on_wa_connect(SimpleNamespace(Error="can-link:disconnected", JID=""))
+            session.is_logging_in = False  # The interrupted login_wrap has returned.
+            await session.on_wa_connect(SimpleNamespace(Error="", JID="15550001111@s.whatsapp.net"))
+            retry.assert_called_once_with()
+        self.assertTrue(owner.sync_error)
+        self.assertEqual(owner.snapshot()["sync"], "error")  # Manual retry is available.
+
+    async def test_interrupted_first_sync_is_pending_not_a_failed_login(self):
+        class Gateway(SimpleNamespace):
+            def __getitem__(self, _):
+                return SimpleNamespace(add_feature=Mock())
+
+        session, owner = self.owner()
+        owner.reserve()
+        owner.connected_attempt = owner.attempt  # Native Connect arrived for this attempt.
+
+        async def original(_):
+            owner.authenticated = False  # Then the transport dropped mid-fill.
+            raise RuntimeError("Roster session changed")
+
+        gateway = Gateway(default_ns="jabber:component:accept", GROUPS=True,
+                          register_handler=Mock(), login_wrap=AsyncMock(side_effect=original))
+        session.logged = True
+        install(gateway)
+        result = await gateway.login_wrap(session)
+        self.assertIn("pendiente", result)
+        self.assertTrue(owner.sync_error)
+        self.assertNotEqual(owner.reason, "login_failed")
+
+    async def test_success_hint_identity_and_gateway_without_groups(self):
+        _, owner = self.owner()
+        self.assertEqual(owner.snapshot().get("identity"), None)
+        first = linking_identity(owner.session, "15550001111@s.whatsapp.net")
+        again = linking_identity(owner.session, "15550001111:7@s.whatsapp.net")
+        other = linking_identity(owner.session, "15550002222@s.whatsapp.net")
+        self.assertEqual(first, again)  # Device suffixes do not change the account.
+        self.assertNotEqual(first, other)
+        self.assertNotIn("15550001111", first)
+        owner.authenticated, owner.identity = True, first
+        owner.change("connected")
+        self.assertEqual(owner.snapshot()["identity"], first)
+        owner.session.contacts.ready.set_result(True)
+        owner.session.xmpp.GROUPS = False
+        owner.session.bookmarks = None
+        self.assertEqual(owner.snapshot()["sync"], "ready")
+
+    async def test_successful_login_sends_a_ready_hint(self):
+        class Gateway(SimpleNamespace):
+            def __getitem__(self, _):
+                return SimpleNamespace(add_feature=Mock())
+
+        session, owner = self.owner()
+        owner.authenticated = True
+        gateway = Gateway(default_ns="jabber:component:accept", GROUPS=True,
+                          register_handler=Mock(), login_wrap=AsyncMock(return_value="ok"))
+        install(gateway)
+        revision = owner.revision
+        with patch.object(owner, "notify") as notify:
+            self.assertEqual(await gateway.login_wrap(session), "ok")
+        notify.assert_called_once_with()
+        self.assertGreater(owner.revision, revision)
+
+
+class HistoryContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unread_summary_parsing_is_strict(self):
+        from slidge_whatsapp.history_state import parse_unread_summary
+
+        def receipt(kind, *ids):
+            return SimpleNamespace(Kind=kind, MessageIDs=list(ids))
+
+        self.assertEqual(parse_unread_summary(receipt(100, "can-unread:1:3:0")), (3, False))
+        self.assertEqual(parse_unread_summary(receipt(100, "can-unread:1:0:1")), (0, True))
+        for bad in (receipt(2, "can-unread:1:3:0"), receipt(100, "can-unread:1:x:0"),
+                    receipt(100, "can-unread:1:3:2"), receipt(100), receipt(100, "a", "b")):
+            self.assertIsNone(parse_unread_summary(bad))
+
+    async def test_history_scope_marks_only_history_stanzas_and_summary_is_forwarded(self):
+        from slidge import can_history
+        from slidge.core.mixins.message_maker import MessageMaker
+        from slidge_whatsapp import history_state
+        from slixmpp import JID, Message
+
+        seen = []
+
+        class Session:
+            async def on_wa_message(self, message):
+                seen.append(can_history.active())
+
+            async def on_wa_receipt(self, receipt):
+                seen.append(("receipt", receipt.Kind))
+
+        history_state.install(Session)
+        session = Session()
+        await session.on_wa_message(SimpleNamespace(IsHistory=True))
+        await session.on_wa_message(SimpleNamespace(IsHistory=False))
+        self.assertEqual(seen, [True, False])
+        self.assertFalse(can_history.active())
+
+        maker = SimpleNamespace(
+            jid=JID("15550001111@whatsapp.example.invalid"), _can_send_carbon=False,
+            xmpp=SimpleNamespace(Message=Message), mtype="chat",
+            _set_msg_id=lambda *_: None, _add_delay=lambda *_: None,
+        )
+        tag = f"{{{can_history.NAMESPACE}}}history"
+        token = can_history.scope(True)
+        try:
+            marked = MessageMaker._make_message(maker, mbody="fixture")
+        finally:
+            can_history.reset(token)
+        live = MessageMaker._make_message(maker, mbody="fixture")
+        self.assertEqual(len(marked.xml.findall(tag)), 1)
+        self.assertIsNone(live.xml.find(tag))
+
+        sent = []
+        with patch.object(history_state, "chat_jid_for", AsyncMock(return_value="c@x.invalid")), \
+                patch.object(history_state, "send_unread_summary",
+                             side_effect=lambda *a: sent.append(a[1:])):
+            await session.on_wa_receipt(SimpleNamespace(
+                Kind=100, MessageIDs=["can-unread:1:4:0"], Chat=SimpleNamespace(IsGroup=False)))
+            await session.on_wa_receipt(SimpleNamespace(Kind=100, MessageIDs=["junk"]))
+            await session.on_wa_receipt(SimpleNamespace(Kind=2, MessageIDs=["m1"]))
+        self.assertEqual(sent, [("c@x.invalid", 4, False, False)])
+        # A malformed summary is dropped; a real receipt still reaches the original.
+        self.assertEqual(seen[-1], ("receipt", 2))
+        self.assertEqual(sum(1 for s in seen if isinstance(s, tuple)), 1)
+
+    async def test_individual_chats_do_not_wait_for_the_group_list(self):
+        from slidge.core.session import BaseSession
+        from slidge_whatsapp.readiness import event_requires_groups, stanza_requires_groups
+        from slixmpp import JID, Message
+
+        wa = SimpleNamespace(EventContact=1, EventPresence=2, EventMessage=3, EventReceipt=4,
+                             EventChatState=5, EventAvatar=6, EventCall=7, EventGroup=8)
+        chat = lambda group: SimpleNamespace(Chat=SimpleNamespace(IsGroup=group))  # noqa: E731
+        for group in (False, True):
+            event = SimpleNamespace(Message=chat(group), Receipt=chat(group),
+                                    ChatState=chat(group), Avatar=SimpleNamespace(IsGroup=group))
+            for kind in (3, 4, 5, 6):
+                self.assertEqual(event_requires_groups(kind, event, wa), group)
+        self.assertFalse(event_requires_groups(1, None, wa))
+        self.assertFalse(event_requires_groups(2, None, wa))
+        self.assertTrue(event_requires_groups(8, None, wa))
+        self.assertTrue(event_requires_groups(99, None, wa))
+        call = SimpleNamespace(Call=SimpleNamespace(Actor=SimpleNamespace(LID="")))
+        self.assertFalse(event_requires_groups(7, call, wa))
+
+        direct = Message(sto=JID("15550001111@whatsapp.example.invalid"), stype="chat")
+        room = Message(sto=JID("#120363000000000001@whatsapp.example.invalid"), stype="chat")
+        muc = Message(sto=JID("x@whatsapp.example.invalid"), stype="groupchat")
+        self.assertFalse(stanza_requires_groups(direct))
+        self.assertTrue(stanza_requires_groups(room))
+        self.assertTrue(stanza_requires_groups(muc))
+
+        loop = asyncio.get_running_loop()
+        fake = SimpleNamespace(ready=loop.create_future(),
+                               contacts=SimpleNamespace(ready=loop.create_future()),
+                               bookmarks=SimpleNamespace(ready=loop.create_future()))
+        fake.ready.set_result(True)
+        fake.contacts.ready.set_result(True)
+        await BaseSession.wait_for_ready(fake, 0.01, groups=False)  # Does not block.
+        with self.assertRaises(Exception):
+            await BaseSession.wait_for_ready(fake, 0.01)
+
+
+def linking_identity(session, jid):
+    from slidge_whatsapp.linking import account_identity
+
+    return account_identity(session, jid)
+
+
 if __name__ == "__main__":
     unittest.main()

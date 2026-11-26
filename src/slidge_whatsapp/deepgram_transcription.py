@@ -27,6 +27,11 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_FFPROBE_TIMEOUT_SECONDS = 15.0
 DEFAULT_DEDUP_RETENTION_DAYS = 30
 DEFAULT_PROCESSING_STALE_SECONDS = 10 * 60.0
+DELIVERY_PRIVATE = "private"
+DELIVERY_REPLY = "reply"
+DELIVERY_MODES = frozenset({DELIVERY_PRIVATE, DELIVERY_REPLY})
+MAX_API_KEY_LENGTH = 256
+MAX_CHAT_OVERRIDES = 2000
 
 
 @dataclass(frozen=True)
@@ -122,6 +127,15 @@ def _connect_state() -> Iterator[sqlite3.Connection]:
         )
         database.execute(
             """
+            CREATE TABLE IF NOT EXISTS account_preferences (
+                account TEXT PRIMARY KEY,
+                service_enabled INTEGER NOT NULL DEFAULT 1,
+                delivery TEXT NOT NULL DEFAULT 'private'
+            )
+            """
+        )
+        database.execute(
+            """
             CREATE TABLE IF NOT EXISTS chat_state (
                 account TEXT NOT NULL,
                 chat TEXT NOT NULL,
@@ -137,6 +151,109 @@ def _connect_state() -> Iterator[sqlite3.Connection]:
         raise
     finally:
         database.close()
+
+
+def _credentials_path() -> Path:
+    configured = os.environ.get("DEEPGRAM_CREDENTIALS_PATH", "").strip()
+    if configured:
+        return Path(configured)
+    return _state_path().with_name("deepgram-credentials.sqlite3")
+
+
+@contextmanager
+def _connect_credentials() -> Iterator[sqlite3.Connection]:
+    """Per-account API keys live apart from the shared state, readable only by us."""
+    path = _credentials_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Create private before any key is written; the volume directory may be shared.
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.close(descriptor)
+    os.chmod(path, 0o600)
+    database = sqlite3.connect(path, timeout=5)
+    try:
+        # DELETE journal: no extra -wal/-shm siblings with default permissions.
+        database.execute("PRAGMA journal_mode = DELETE")
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_key (
+                account TEXT PRIMARY KEY,
+                api_key TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        yield database
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    finally:
+        database.close()
+
+
+def normalize_api_key(api_key: str) -> str:
+    """Validate the shape of a key typed by the user; never log the value."""
+    key = api_key.strip()
+    if not key or len(key) > MAX_API_KEY_LENGTH or any(
+        char.isspace() or not char.isprintable() for char in key
+    ):
+        raise ValueError("invalid API key")
+    return key
+
+
+def account_api_key(account: str) -> str:
+    account = _account_key(account)
+    if not account:
+        return ""
+    with _connect_credentials() as database:
+        row = database.execute(
+            "SELECT api_key FROM account_key WHERE account = ?", (account,)
+        ).fetchone()
+    return str(row[0]) if row is not None else ""
+
+
+def set_account_api_key(account: str, api_key: str | None) -> None:
+    account = _account_key(account)
+    if not account:
+        raise ValueError("account must not be empty")
+    with _connect_credentials() as database:
+        if api_key is None:
+            database.execute("DELETE FROM account_key WHERE account = ?", (account,))
+            return
+        database.execute(
+            """
+            INSERT INTO account_key(account, api_key, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(account) DO UPDATE SET
+                api_key = excluded.api_key,
+                updated_at = excluded.updated_at
+            """,
+            (account, normalize_api_key(api_key), time.time()),
+        )
+
+
+def api_key_hint(api_key: str) -> str:
+    """Enough to recognise a key without disclosing it."""
+    return api_key[-4:] if len(api_key) >= 12 else ""
+
+
+def effective_api_key(account: str) -> str:
+    """The account's own key, else the server key when this account may use it."""
+    own = account_api_key(account)
+    if own:
+        return own
+    server = _configured_api_key()
+    if server and _jid_allowed(account, "DEEPGRAM_ALLOWED_JIDS"):
+        return server
+    return ""
+
+
+def api_key_source(account: str) -> str:
+    if account_api_key(account):
+        return "account"
+    if _configured_api_key() and _jid_allowed(account, "DEEPGRAM_ALLOWED_JIDS"):
+        return "server"
+    return "none"
 
 
 def _account_key(account: str) -> str:
@@ -180,8 +297,88 @@ def chat_transcription_override(account: str, chat: str) -> bool | None:
     return None if row is None else bool(row[0])
 
 
+def _account_preferences(account: str) -> tuple[bool, str]:
+    account = _account_key(account)
+    with _connect_state() as database:
+        row = database.execute(
+            "SELECT service_enabled, delivery FROM account_preferences WHERE account = ?",
+            (account,),
+        ).fetchone()
+    if row is None:
+        return True, DELIVERY_PRIVATE
+    delivery = str(row[1])
+    return bool(row[0]), delivery if delivery in DELIVERY_MODES else DELIVERY_PRIVATE
+
+
+def service_enabled(account: str) -> bool:
+    return _account_preferences(account)[0]
+
+
+def delivery_mode(account: str) -> str:
+    return _account_preferences(account)[1]
+
+
+def _set_account_preference(account: str, column: str, value: object) -> None:
+    if column not in {"service_enabled", "delivery"}:
+        raise ValueError("unknown preference")
+    account = _account_key(account)
+    with _connect_state() as database:
+        database.execute(
+            "INSERT OR IGNORE INTO account_preferences(account) VALUES (?)", (account,)
+        )
+        database.execute(
+            f"UPDATE account_preferences SET {column} = ? WHERE account = ?",
+            (value, account),
+        )
+
+
+def set_service_enabled(account: str, enabled: bool) -> None:
+    _set_account_preference(account, "service_enabled", int(enabled))
+
+
+def set_delivery_mode(account: str, mode: str) -> None:
+    if mode not in DELIVERY_MODES:
+        raise ValueError("unknown delivery mode")
+    _set_account_preference(account, "delivery", mode)
+
+
+def auto_transcription_enabled(account: str) -> bool:
+    return _global_transcription_enabled(account)
+
+
+def chat_transcription_overrides(account: str) -> dict[str, bool]:
+    account = _account_key(account)
+    with _connect_state() as database:
+        rows = database.execute(
+            "SELECT chat, enabled FROM chat_state WHERE account = ? ORDER BY chat",
+            (account,),
+        ).fetchall()
+    return {str(chat): bool(enabled) for chat, enabled in rows}
+
+
+def replace_chat_transcription_overrides(account: str, overrides: dict[str, bool]) -> None:
+    """Replace every per-chat exception at once (preferences dialog semantics)."""
+    account = _account_key(account)
+    cleaned = {_chat_key(chat): bool(enabled) for chat, enabled in overrides.items()}
+    cleaned.pop("", None)
+    if len(cleaned) > MAX_CHAT_OVERRIDES:
+        raise ValueError("too many chat overrides")
+    with _connect_state() as database:
+        database.execute("DELETE FROM chat_state WHERE account = ?", (account,))
+        database.executemany(
+            "INSERT INTO chat_state(account, chat, enabled) VALUES (?, ?, ?)",
+            [(account, chat, int(enabled)) for chat, enabled in cleaned.items()],
+        )
+
+
+def transcription_available(account: str) -> bool:
+    """A key exists for the account and the user has not switched the service off."""
+    return bool(effective_api_key(account)) and service_enabled(account)
+
+
 def transcription_enabled(account: str, chat: str = "") -> bool:
-    if not _configured_api_key() or not _jid_allowed(account, "DEEPGRAM_ALLOWED_JIDS"):
+    """Whether a live voice note in ``chat`` is transcribed automatically."""
+    if not transcription_available(account):
         return False
     override = chat_transcription_override(account, chat)
     if override is not None:
@@ -410,9 +607,11 @@ async def transcribe_audio(
     data: bytes,
     content_type: str = "",
     filename: str = "",
+    api_key: str | None = None,
 ) -> str | None:
     """Transcribe one audio attachment, or return None when disabled."""
-    api_key = _configured_api_key()
+    if api_key is None:
+        api_key = _configured_api_key()
     if not api_key or not data:
         return None
 
@@ -520,8 +719,11 @@ async def _get_json(
 
 async def validate_transcription_configuration(
     http: aiohttp.ClientSession,
+    api_key: str | None = None,
 ) -> bool | None:
-    api_key = _configured_api_key()
+    """True valid, False rejected by Deepgram, None when it could not be checked."""
+    if api_key is None:
+        api_key = _configured_api_key()
     if not api_key:
         return False
     try:
@@ -589,7 +791,29 @@ def format_credit_balances(balances: dict[str, Decimal]) -> str:
 
 
 def _command_authorized(account: str) -> bool:
+    # An account that brought its own key may manage its own transcription.
+    return _jid_allowed(account, "DEEPGRAM_COMMAND_JIDS") or bool(account_api_key(account))
+
+
+def _owner_command_authorized(account: str) -> bool:
     return _jid_allowed(account, "DEEPGRAM_COMMAND_JIDS")
+
+
+def describe_transcription_state(account: str) -> str:
+    key = {
+        "account": "clave propia",
+        "server": "clave del servidor",
+        "none": "sin clave",
+    }[api_key_source(account)]
+    service = "activado" if service_enabled(account) else "desactivado"
+    auto = "activadas" if auto_transcription_enabled(account) else "desactivadas"
+    delivery = (
+        "respuesta en el chat" if delivery_mode(account) == DELIVERY_REPLY else "privadas"
+    )
+    return (
+        f"Servicio {service} ({key}). Transcripciones automáticas {auto}. "
+        f"Entrega: {delivery}."
+    )
 
 
 async def handle_transcription_command(
@@ -606,9 +830,29 @@ async def handle_transcription_command(
 
     command = parts[0]
     if command == "/transcribe":
+        if len(parts) == 2 and parts[1] in {"reply", "responder", "private", "privado"}:
+            mode = DELIVERY_REPLY if parts[1] in {"reply", "responder"} else DELIVERY_PRIVATE
+            set_delivery_mode(account, mode)
+            if mode == DELIVERY_REPLY:
+                return "Las transcripciones se enviarán al chat como respuesta a cada audio."
+            return "Las transcripciones serán privadas: no se enviarán al chat."
+
+        if len(parts) == 3 and parts[1] == "service" and parts[2] in {"on", "off", "of"}:
+            enabled = parts[2] == "on"
+            if enabled and not effective_api_key(account):
+                return (
+                    "No se puede activar: el servicio de transcripción no está "
+                    "configurado."
+                )
+            set_service_enabled(account, enabled)
+            return f"Servicio de transcripción {'activado' if enabled else 'desactivado'}."
+
+        if len(parts) == 2 and parts[1] == "status":
+            return describe_transcription_state(account)
+
         if len(parts) == 2 and parts[1] in {"on", "off", "of"}:
             enabled = parts[1] == "on"
-            if enabled and not _configured_api_key():
+            if enabled and not effective_api_key(account):
                 return (
                     "No se puede activar: el servicio de transcripción no está "
                     "configurado."
@@ -639,7 +883,7 @@ async def handle_transcription_command(
                         f"Estado efectivo: {effective}."
                     )
                 enabled = parts[2] == "on"
-                if enabled and not _configured_api_key():
+                if enabled and not effective_api_key(account):
                     return (
                         "No se puede activar: el servicio de transcripción no está "
                         "configurado."
@@ -651,14 +895,16 @@ async def handle_transcription_command(
                 )
 
         return (
-            "Uso: /transcribe on|off o "
-            "/transcribe here [on|off|default]."
+            "Uso: /transcribe on|off, /transcribe here [on|off|default], "
+            "/transcribe reply|private, /transcribe service on|off o "
+            "/transcribe status."
         )
 
     if command == "/status":
-        if not _configured_api_key():
+        api_key = effective_api_key(account)
+        if not api_key:
             return "Servicio de transcripción no configurado correctamente."
-        valid = await validate_transcription_configuration(http)
+        valid = await validate_transcription_configuration(http, api_key)
         if valid is False:
             return "Servicio de transcripción no configurado correctamente."
         state = "activado" if transcription_enabled(account) else "desactivado"
@@ -668,6 +914,9 @@ async def handle_transcription_command(
                 f"comprobarse en este momento. Estado: {state}."
             )
         return f"Servicio de transcripción configurado correctamente. Estado: {state}."
+
+    if not _owner_command_authorized(account):
+        return "Comando de transcripción no autorizado para esta cuenta."
 
     try:
         balances = await get_credit_balances(http)

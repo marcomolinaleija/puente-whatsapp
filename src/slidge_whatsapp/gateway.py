@@ -15,6 +15,7 @@ from .generated import whatsapp
 from .linking import install as install_linking
 from .voice import install as install_voice
 from .message_info import install
+from .transcription_iq import install as install_transcription
 
 if TYPE_CHECKING:
     from .session import Session
@@ -86,6 +87,7 @@ class Gateway(BaseGateway["Session"]):
         install_voice(self)
         install(self)
         install_linking(self)
+        install_transcription(self)
 
     async def validate(
         self, user_jid: JID, registration_form: dict[str, str | None]

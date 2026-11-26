@@ -40,16 +40,22 @@ from .group import MUC, Bookmarks, Participant
 import time
 from .readiness import event_requires_groups, stanza_requires_groups
 from .deepgram_transcription import (
+    DELIVERY_REPLY,
     build_audio_dedup_key,
     claim_audio,
     complete_audio,
+    delivery_mode,
+    effective_api_key,
     format_audio_duration,
     inspect_audio,
     is_audio_attachment,
     release_audio,
+    transcription_available,
     transcription_enabled,
     transcribe_audio,
 )
+
+TRANSCRIPTION_REPLY_QUOTE = "Mensaje de voz"
 
 MESSAGE_PAIR_SUCCESS = (
     "Pairing successful! You might need to repeat this process in the future if the"
@@ -560,6 +566,8 @@ class Session(BaseSession[Contact]):
                         data,
                         content_type,
                         filename,
+                        muc=muc,
+                        audio_id=message.ID,
                     ),
                     name="deepgram-transcription",
                 )
@@ -582,6 +590,8 @@ class Session(BaseSession[Contact]):
         data: bytes,
         content_type: str,
         filename: str,
+        muc: MUC | None = None,
+        audio_id: str = "",
     ) -> None:
         if not claim_audio(account, dedupe_key):
             self.log.info("Skipping duplicate audio transcription: %s", dedupe_key)
@@ -602,6 +612,7 @@ class Session(BaseSession[Contact]):
                 data,
                 content_type=content_type,
                 filename=filename,
+                api_key=effective_api_key(account),
             )
             elapsed = time.perf_counter() - started_at
             complete_audio(account, dedupe_key)
@@ -615,15 +626,180 @@ class Session(BaseSession[Contact]):
             )
             return
         if transcript:
-            duration = (
-                f" Audio: {format_audio_duration(inspection.duration_seconds)}."
-                if inspection.duration_seconds is not None
-                else ""
+            await self.deliver_transcript(
+                actor,
+                muc,
+                audio_id,
+                transcript,
+                duration_seconds=inspection.duration_seconds,
+                elapsed_seconds=elapsed,
+                delivery=delivery_mode(account),
             )
+
+    async def deliver_transcript(
+        self,
+        actor: Contact | Participant | None,
+        muc: MUC | None,
+        audio_id: str,
+        transcript: str,
+        *,
+        duration_seconds: float | None,
+        elapsed_seconds: float,
+        delivery: str,
+        own_audio: bool = False,
+    ) -> None:
+        """Send a transcript privately over XMPP, or as a WhatsApp reply to the audio."""
+        duration = (
+            f" Audio: {format_audio_duration(duration_seconds)}."
+            if duration_seconds is not None
+            else ""
+        )
+        if delivery == DELIVERY_REPLY and audio_id:
+            try:
+                await self.__reply_with_transcript(actor, muc, audio_id, transcript, own_audio)
+                return
+            except Exception as exc:
+                # Never lose the transcript: fall back to the private copy.
+                self.log.warning("Transcript reply to %s failed: %s", audio_id, exc)
+        text = (
+            f'Transcripción: "{transcript}".{duration} '
+            f"Transcrito en {elapsed_seconds:.1f} s."
+        )
+        if actor is None:
+            self.send_gateway_message(text)
+            return
+        reply_to = (
+            MessageReference(legacy_id=audio_id, author="user" if own_audio else actor)
+            if audio_id
+            else None
+        )
+        actor.send_text(text, reply_to=reply_to)
+
+    async def __reply_with_transcript(
+        self,
+        actor: Contact | Participant | None,
+        muc: MUC | None,
+        audio_id: str,
+        transcript: str,
+        own_audio: bool,
+    ) -> None:
+        text = f"Transcripción: {transcript}"
+        message_id: str = self.whatsapp.GenerateMessageID()  # type:ignore[no-untyped-call]
+        if muc is None:
+            if not isinstance(actor, Contact):
+                raise ValueError("a private reply needs a contact")
+            origin = (
+                whatsapp.Actor(JID=self.contacts.user_legacy_id, IsMe=True)  # type:ignore[no-untyped-call]
+                if own_audio
+                else whatsapp.Actor(JID=actor._wa_legacy_id())  # type:ignore[no-untyped-call]
+            )
+            wa_message = whatsapp.Message(  # type:ignore[no-untyped-call]
+                ID=message_id,
+                Chat=actor.get_wa_chat(),
+                Body=text,
+                ReplyID=audio_id,
+                ReplyBody=TRANSCRIPTION_REPLY_QUOTE,
+                OriginActor=origin,
+            )
+            await asyncio.to_thread(self.whatsapp.SendMessage, wa_message)
+            # WhatsApp does not echo our own send back: reflect it as a carbon.
             actor.send_text(
-                f'Transcripción: "{transcript}".{duration} '
-                f"Transcrito en {elapsed:.1f} s."
+                text,
+                legacy_msg_id=message_id,
+                carbon=True,
+                reply_to=MessageReference(
+                    legacy_id=audio_id, author="user" if own_audio else actor
+                ),
             )
+            return
+
+        origin = whatsapp.Actor(GroupJID=muc.legacy_id)  # type:ignore[no-untyped-call]
+        if own_audio or actor is None:
+            origin.IsMe = True
+            origin.JID = self.contacts.user_legacy_id
+        else:
+            participant = cast(Participant, actor)
+            if participant.contact:
+                origin.JID = participant.contact.legacy_id
+            if participant.occupant_id and participant.occupant_id.endswith("@lid"):
+                origin.LID = participant.occupant_id
+        wa_message = whatsapp.Message(  # type:ignore[no-untyped-call]
+            ID=message_id,
+            Chat=muc.get_wa_chat(),
+            Body=text,
+            ReplyID=audio_id,
+            ReplyBody=TRANSCRIPTION_REPLY_QUOTE,
+            OriginActor=origin,
+        )
+        from .message_info import outgoing_sent, prepare_outgoing
+
+        snapshot = await prepare_outgoing(muc, wa_message)
+        await asyncio.to_thread(self.whatsapp.SendMessage, wa_message)
+        await outgoing_sent(muc, wa_message, snapshot)
+        user_participant = await muc.get_user_participant()
+        user_participant.send_text(
+            text,
+            legacy_msg_id=message_id,
+            reply_to=MessageReference(
+                legacy_id=audio_id,
+                author=user_participant if own_audio or actor is None else actor,
+            ),
+        )
+
+    async def transcribe_on_demand(
+        self,
+        recipient: Contact | MUC,
+        audio_id: str,
+        data: bytes,
+        content_type: str,
+        filename: str,
+        delivery: str,
+        own_audio: bool,
+    ) -> str:
+        """Transcribe one stored voice note when the user asks; returns the text."""
+        account = str(self.user_jid.bare)
+        if not transcription_available(account):
+            raise XMPPError("service-unavailable", "Transcripción no configurada o desactivada")
+        inspection = await inspect_audio(data, content_type, filename)
+        if not inspection.accepted:
+            raise XMPPError("not-acceptable", inspection.reason or "Audio no admitido")
+        started_at = time.perf_counter()
+        transcript = await transcribe_audio(
+            self.http,
+            data,
+            content_type=content_type,
+            filename=filename,
+            api_key=effective_api_key(account),
+        )
+        elapsed = time.perf_counter() - started_at
+        if not transcript:
+            return ""
+        actor: Contact | Participant | None
+        muc: MUC | None
+        if isinstance(recipient, MUC):
+            muc = recipient
+            actor = None
+            if not own_audio:
+                try:
+                    lid = muc.get_sender_lid(audio_id)
+                    actor = await muc.get_participant(occupant_id=lid)
+                except Exception:
+                    actor = None
+            own_audio = own_audio or actor is None
+        else:
+            muc = None
+            actor = recipient
+        await self.deliver_transcript(
+            actor,
+            muc,
+            audio_id,
+            transcript,
+            duration_seconds=inspection.duration_seconds,
+            elapsed_seconds=elapsed,
+            delivery=delivery,
+            own_audio=own_audio,
+        )
+        return transcript
 
     @delivery_scope
     async def on_wa_msg_edit(
@@ -811,7 +987,11 @@ class Session(BaseSession[Contact]):
         if not is_valid_phone_number(phone):
             raise ValueError("Not a valid phone number", phone)
 
-        data: whatsapp.Contact = self.whatsapp.FindContact(phone)  # type:ignore[no-untyped-call]
+        # FindContact may query WhatsApp (IsOnWhatsApp): run it off the event
+        # loop so a new-chat lookup never stalls every other session and stanza.
+        data: whatsapp.Contact = await asyncio.to_thread(
+            self.whatsapp.FindContact, phone  # type:ignore[no-untyped-call]
+        )
         if not data.Actor.JID:
             return None
 

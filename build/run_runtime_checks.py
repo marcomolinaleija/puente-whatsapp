@@ -32,7 +32,7 @@ def main() -> None:
                         for row in rows if row.get("Action") == "skip"],
         }
     scripts = sorted(ROOT.glob("smoke_*.py")) + [ROOT / "test_bridge_linking.py"]
-    assert len(scripts) == 23, "Runtime inventory changed; review the release gate"
+    assert len(scripts) == 24, "Runtime inventory changed; review the release gate"
     for script in scripts:
         args = [sys.executable, "-B", str(script)]
         if script.name == "smoke_slidge_watchdog.py":

@@ -1,6 +1,6 @@
 # Puente WhatsApp CAN
 
-Versión publicada: **v40**. Consulta `release-manifest.json` para la imagen y el
+Versión publicada: **v42**. Consulta `release-manifest.json` para la imagen y el
 digest verificados, y [CHANGELOG.md](CHANGELOG.md) para los cambios y sus pruebas.
 
 Fuente de trabajo para el puente entre XMPP y WhatsApp. El código inicial se recuperó

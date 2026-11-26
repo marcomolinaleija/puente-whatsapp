@@ -1,9 +1,10 @@
 # Publicaciones del puente
 
-## v42 — candidata del 26 de noviembre de 2026 (sin publicar)
+## v42 — 26 de noviembre de 2026
 
-Construida en `marco-vps` desde b8efeeb con el target `release`; no está en GHCR ni
-desplegada. Aprobó Go, Go/race, las 24 comprobaciones del runtime y el probe de entrada.
+Imagen `ghcr.io/marcomolinaleija/cliente-xmpp-bridge:v42`, plataforma `linux/amd64`.
+Digest: `sha256:d0e5b5fd152a95f9ccadbabf0e27d2a01cafdc810d28d4f9c9e7f4b724efe7ae`.
+Código construido: [67e90d8](https://github.com/marcomolinaleija/puente-whatsapp/commit/67e90d82ffe6a1e5b502c86db1dd0ac60420ad41).
 
 - Deepgram por cuenta: clave propia en un archivo `600` (nunca devuelta ni registrada),
   servicio, transcripción automática, entrega privada o como respuesta en el chat y
@@ -13,6 +14,23 @@ desplegada. Aprobó Go, Go/race, las 24 comprobaciones del runtime y el probe de
 - Transcripción bajo demanda de audios del directorio de adjuntos, sin descargar URLs.
 - Las transcripciones privadas citan su nota de voz.
 - La búsqueda de números (XEP-0055/0100) ya no bloquea el bucle del puente.
+- Buscar el número de la propia cuenta responde `not-acceptable` (`own-number`) en vez
+  de un error interno; un contacto no resuelto responde `item-not-found`.
+- Incluye todo lo de v41: historial marcado con `urn:can:whatsapp:history:0`, resumen
+  de no leídos del teléfono sin confirmar lectura y sincronización tras vincular que
+  se completa o se reintenta al reconectar.
+
+El target `release` aprobó Go, Go/race, las 24 comprobaciones del runtime y el probe
+de entrada. Se desplegó en `marco-vps` antes de publicarse (`healthy`). La publicación
+comprobó que no existía `v42` y que la última etiqueta era `v40`. Se subió sin reconstruir
+la imagen que ya corría en producción, y el manifiesto anónimo por digest apunta a su
+configuración `sha256:7e36ce62…`. La validación con un teléfono real queda para prueba humana.
+
+## v41 — 26 de noviembre de 2026 (no publicada)
+
+Construida en `marco-vps` desde [7ff00c0](https://github.com/marcomolinaleija/puente-whatsapp/commit/7ff00c09756e02c271d66dbf0905d0f548ca6489)
+con el target `release` y desplegada en producción hasta que la sustituyó v42. No está
+en GHCR; sus cambios están incluidos en v42.
 
 ## v40 — 25 de noviembre de 2026
 
